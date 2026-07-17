@@ -1,0 +1,28 @@
+{
+	admin off
+}
+
+{$APP_DOMAIN:localhost} {
+	encode zstd gzip
+
+	# Defesa adicional para versões afetadas por bypass de middleware/proxy.
+	# A autorização também deve ser validada dentro da aplicação.
+	@middleware_bypass header x-middleware-subrequest *
+	respond @middleware_bypass "Requisição inválida" 400
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+	}
+
+	reverse_proxy 127.0.0.1:{$APP_PORT:3000} {
+		# Mantém streaming do App Router sem buffering no proxy.
+		flush_interval -1
+	}
+
+	log
+}
