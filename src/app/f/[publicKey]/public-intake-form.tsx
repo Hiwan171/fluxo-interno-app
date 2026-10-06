@@ -51,8 +51,18 @@ function mapField(field: PublicFormFieldRow): FormFieldDTO | null {
           ? (field.options as Array<{ label: string; value: string }>)
           : [],
       }
+    case "radio":
+      return {
+        ...base,
+        type: "radio",
+        options: Array.isArray(field.options)
+          ? (field.options as Array<{ label: string; value: string }>)
+          : [],
+      }
     case "email":
       return { ...base, type: "email" }
+    case "attachment":
+      return { ...base, type: "file", multiple: true }
     default:
       return null
   }

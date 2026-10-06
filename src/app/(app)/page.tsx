@@ -5,15 +5,25 @@ import { EmptyState } from "@/components/app/empty-state";
 import { getCurrentSession } from "@/lib/auth";
 import { listWorkspaceBoards, listWorkspacesForCurrentUser } from "@/lib/dal";
 
-export default async function DashboardPage() {
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ workspace?: string }>;
+}) {
   const session = await getCurrentSession();
-  const workspaces = await listWorkspacesForCurrentUser();
+  const [workspaces, { workspace: requestedSlug }] = await Promise.all([
+    listWorkspacesForCurrentUser(),
+    searchParams,
+  ]);
 
   if (!session) {
     return null;
   }
 
-  const workspace = workspaces[0];
+  // O espaço escolhido vem da URL, para sobreviver a um recarregamento e poder
+  // ser compartilhado. Antes só o primeiro da lista era alcançável.
+  const workspace =
+    workspaces.find((item) => item.slug === requestedSlug) ?? workspaces[0];
 
   if (!workspace) {
     return (
@@ -42,6 +52,12 @@ export default async function DashboardPage() {
     <DashboardView
       workspaceId={workspace.id}
       workspaceName={workspace.name}
+      workspaces={workspaces.map((item) => ({
+        id: item.id,
+        name: item.name,
+        slug: item.slug,
+      }))}
+      isSystemAdmin={session.user.systemRole === "admin"}
       user={{
         id: session.user.id,
         name: session.user.name,
@@ -54,6 +70,7 @@ export default async function DashboardPage() {
         id: board.id,
         name: board.name,
         color: board.color,
+        icon: board.icon,
         visibility: board.visibility,
         cardCount: board.cardCount,
       }))}

@@ -3,9 +3,18 @@
 import { revalidatePath } from "next/cache";
 
 import { CUSTOM_FIELD_NAME_PREFIX } from "@/components/app/custom-field-mapping";
-import type { FormSubmitResult } from "@/components/app/types";
+import type { FormSubmitResult, KanbanCardDTO } from "@/components/app/types";
+import {
+  assertSubmissionWithinLimits,
+  AttachmentValidationError,
+  commitUploadedFiles,
+  discardPendingFiles,
+  saveUploadedFile,
+  type UploadedFileMeta,
+} from "@/lib/attachments";
 import {
   archiveCardForCurrentUser,
+  assignCardForCurrentUser,
   AuthorizationError,
   ConflictError,
   createCardForCurrentUser,
@@ -16,30 +25,101 @@ import {
   getCardActivityForCurrentUser,
   movePhaseForCurrentUser,
   moveCardForCurrentUser,
+  searchBoardCardsForCurrentUser,
   sendCardEmailForCurrentUser,
+  unassignCardForCurrentUser,
   updateCardForCurrentUser,
   updatePhaseForCurrentUser,
 } from "@/lib/dal";
+import { FieldValidationError } from "@/lib/field-values";
 import { cardPrioritySchema } from "@/lib/validation";
 
-function extractCustomFieldValues(formData: FormData) {
+type ExtractedFieldValues = {
+  values: Record<string, unknown>;
+  pendingFiles: UploadedFileMeta[];
+};
+
+/**
+ * Os arquivos ficam em área temporária até a transação do card ser confirmada;
+ * quem chama precisa promover com `commitUploadedFiles` ou limpar com
+ * `discardPendingFiles`.
+ */
+async function extractCustomFieldValues(
+  formData: FormData,
+): Promise<ExtractedFieldValues> {
   const values: Record<string, unknown> = {};
+  const fileEntriesByField = new Map<string, File[]>();
 
   for (const [key, value] of formData.entries()) {
     if (!key.startsWith(CUSTOM_FIELD_NAME_PREFIX)) continue;
     const fieldId = key.slice(CUSTOM_FIELD_NAME_PREFIX.length);
+
+    if (value instanceof File) {
+      if (value.size === 0 && !value.name) continue;
+      const list = fileEntriesByField.get(fieldId) ?? [];
+      list.push(value);
+      fileEntriesByField.set(fieldId, list);
+      continue;
+    }
+
     values[fieldId] = value === "true" ? true : value === "false" ? false : value;
   }
 
-  return values;
+  assertSubmissionWithinLimits(
+    Array.from(fileEntriesByField.values()).flat(),
+  );
+
+  const pendingFiles: UploadedFileMeta[] = [];
+
+  try {
+    for (const [fieldId, files] of fileEntriesByField) {
+      const uploaded = await Promise.all(
+        files.map((file) => saveUploadedFile(file)),
+      );
+      pendingFiles.push(...uploaded);
+      values[fieldId] = { kind: "attachment", files: uploaded };
+    }
+  } catch (error) {
+    await discardPendingFiles(pendingFiles);
+    throw error;
+  }
+
+  return { values, pendingFiles };
+}
+
+/**
+ * O Next substitui a mensagem de erros lançados de server actions em produção,
+ * para não vazar detalhe interno ao cliente. Por isso estas ações devolvem o
+ * texto em vez de lançar: é a única forma de o usuário ler o motivo real —
+ * "a fase atingiu o limite", e não "algo deu errado".
+ */
+function describeActionFailure(
+  error: unknown,
+  fallback: string,
+): FormSubmitResult {
+  if (
+    error instanceof ConflictError ||
+    error instanceof AuthorizationError ||
+    error instanceof FieldValidationError
+  ) {
+    return { error: error.message };
+  }
+
+  return { error: fallback };
 }
 
 export async function moveCardAction(
   boardId: string,
   input: { cardId: string; destinationPhaseId: string; position: number },
-) {
-  await moveCardForCurrentUser(input);
+): Promise<FormSubmitResult> {
+  try {
+    await moveCardForCurrentUser(input);
+  } catch (error) {
+    return describeActionFailure(error, "Não foi possível mover o card.");
+  }
+
   revalidatePath(`/boards/${boardId}`);
+  return { success: true };
 }
 
 export async function createCardAction(
@@ -57,7 +137,12 @@ export async function createCardAction(
   const priorityResult = cardPrioritySchema.safeParse(priorityInput);
   const dueAtValue = String(formData.get("dueAt") ?? "").trim();
 
+  let pendingFiles: UploadedFileMeta[] = [];
+
   try {
+    const extracted = await extractCustomFieldValues(formData);
+    pendingFiles = extracted.pendingFiles;
+
     await createCardForCurrentUser({
       boardId,
       phaseId,
@@ -65,9 +150,20 @@ export async function createCardAction(
       description: String(formData.get("description") ?? "").trim() || null,
       priority: priorityResult.success ? priorityResult.data : "medium",
       dueAt: dueAtValue || null,
-      fieldValues: extractCustomFieldValues(formData),
+      fieldValues: extracted.values,
     });
-  } catch {
+
+    await commitUploadedFiles(pendingFiles);
+  } catch (error) {
+    await discardPendingFiles(pendingFiles);
+
+    if (
+      error instanceof AttachmentValidationError ||
+      error instanceof FieldValidationError ||
+      error instanceof ConflictError
+    ) {
+      return { error: error.message };
+    }
     return { error: "Não foi possível criar o card." };
   }
 
@@ -90,15 +186,31 @@ export async function updateCardAction(
   const priorityResult = cardPrioritySchema.safeParse(priorityInput);
   const dueAtValue = String(formData.get("dueAt") ?? "").trim();
 
+  let pendingFiles: UploadedFileMeta[] = [];
+
   try {
+    const extracted = await extractCustomFieldValues(formData);
+    pendingFiles = extracted.pendingFiles;
+
     await updateCardForCurrentUser(cardId, {
       title,
       description: String(formData.get("description") ?? "").trim() || null,
       priority: priorityResult.success ? priorityResult.data : "medium",
       dueAt: dueAtValue || null,
-      fieldValues: extractCustomFieldValues(formData),
+      fieldValues: extracted.values,
     });
-  } catch {
+
+    await commitUploadedFiles(pendingFiles);
+  } catch (error) {
+    await discardPendingFiles(pendingFiles);
+
+    if (
+      error instanceof AttachmentValidationError ||
+      error instanceof FieldValidationError ||
+      error instanceof ConflictError
+    ) {
+      return { error: error.message };
+    }
     return { error: "Não foi possível salvar as alterações." };
   }
 
@@ -106,14 +218,26 @@ export async function updateCardAction(
   return { success: true };
 }
 
-export async function duplicateCardAction(boardId: string, cardId: string) {
-  await duplicateCardForCurrentUser(cardId);
+export async function duplicateCardAction(boardId: string, cardId: string): Promise<FormSubmitResult> {
+  try {
+    await duplicateCardForCurrentUser(cardId);
+  } catch (error) {
+    return describeActionFailure(error, "Não foi possível duplicar o card.");
+  }
+
   revalidatePath(`/boards/${boardId}`);
+  return { success: true };
 }
 
-export async function archiveCardAction(boardId: string, cardId: string) {
-  await archiveCardForCurrentUser(cardId);
+export async function archiveCardAction(boardId: string, cardId: string): Promise<FormSubmitResult> {
+  try {
+    await archiveCardForCurrentUser(cardId);
+  } catch (error) {
+    return describeActionFailure(error, "Não foi possível arquivar o card.");
+  }
+
   revalidatePath(`/boards/${boardId}`);
+  return { success: true };
 }
 
 export async function createPhaseAction(
@@ -180,26 +304,33 @@ export async function updatePhaseAction(
   return { success: true };
 }
 
-export async function deletePhaseAction(boardId: string, phaseId: string) {
+export async function deletePhaseAction(
+  boardId: string,
+  phaseId: string,
+): Promise<FormSubmitResult> {
   try {
     await deletePhaseForCurrentUser(phaseId);
   } catch (error) {
-    if (error instanceof ConflictError || error instanceof AuthorizationError) {
-      throw new Error(error.message);
-    }
-    throw new Error("Não foi possível excluir a fase.");
+    return describeActionFailure(error, "Não foi possível excluir a fase.");
   }
 
   revalidatePath(`/boards/${boardId}`);
+  return { success: true };
 }
 
 export async function movePhaseAction(
   boardId: string,
   phaseId: string,
   direction: "left" | "right",
-) {
-  await movePhaseForCurrentUser(phaseId, direction);
+): Promise<FormSubmitResult> {
+  try {
+    await movePhaseForCurrentUser(phaseId, direction);
+  } catch (error) {
+    return describeActionFailure(error, "Não foi possível mover a fase.");
+  }
+
   revalidatePath(`/boards/${boardId}`);
+  return { success: true };
 }
 
 export async function getCardActivityAction(cardId: string) {
@@ -217,14 +348,55 @@ export async function getCardActivityAction(cardId: string) {
     emails: activity.emails.map((email) => ({
       id: email.id,
       status: email.status,
+      fromAddress: email.fromAddress,
       toAddresses: email.toAddresses,
       subject: email.subject,
       textBody: email.textBody,
       errorMessage: email.errorMessage,
+      isAutomated: email.templateId !== null,
       sentAt: email.sentAt ? email.sentAt.toISOString() : null,
       createdAt: email.createdAt.toISOString(),
     })),
+    history: activity.history.map((entry) => ({
+      id: entry.id,
+      type: entry.type,
+      metadata: entry.metadata,
+      // Sem ator significa origem anônima — um envio pelo formulário público.
+      actorName: entry.actorId ? (entry.actorName ?? "Usuário removido") : null,
+      actorAvatarUrl: entry.actorAvatarUrl,
+      occurredAt: entry.occurredAt.toISOString(),
+    })),
   };
+}
+
+export async function assignCardAction(
+  boardId: string,
+  cardId: string,
+  userId: string,
+): Promise<FormSubmitResult> {
+  try {
+    await assignCardForCurrentUser(cardId, userId);
+  } catch (error) {
+    return describeActionFailure(error, "Não foi possível atribuir o responsável.");
+  }
+
+  revalidatePath(`/boards/${boardId}`);
+  return { success: true };
+}
+
+export async function unassignCardAction(
+  boardId: string,
+  cardId: string,
+  userId: string,
+): Promise<FormSubmitResult> {
+  try {
+    await unassignCardForCurrentUser(cardId, userId);
+  } catch (error) {
+    return describeActionFailure(error, "Não foi possível remover o responsável.");
+  }
+
+  revalidatePath(`/boards/${boardId}`);
+  return { success: true };
 }
 
 export async function addCommentAction(
@@ -277,4 +449,48 @@ export async function sendCardEmailAction(
 
   revalidatePath(`/boards/${boardId}`);
   return { success: true };
+}
+
+export type BoardSearchResult = {
+  cards: KanbanCardDTO[];
+};
+
+/**
+ * Busca em todo o quadro, não só nos cards carregados.
+ *
+ * O kanban traz no máximo 100 cards por fase; filtrar no cliente deixaria de
+ * fora exatamente os cards antigos que alguém está procurando.
+ */
+export async function searchBoardCardsAction(
+  boardId: string,
+  query: string,
+): Promise<BoardSearchResult> {
+  const { cards, assignees } = await searchBoardCardsForCurrentUser(
+    boardId,
+    query,
+  );
+
+  const assigneesByCard = new Map<string, KanbanCardDTO["assignees"]>();
+  for (const assignee of assignees) {
+    const list = assigneesByCard.get(assignee.cardId) ?? [];
+    list.push({
+      id: assignee.userId,
+      name: assignee.name,
+      avatarUrl: assignee.avatarUrl,
+    });
+    assigneesByCard.set(assignee.cardId, list);
+  }
+
+  return {
+    cards: cards.map((card) => ({
+      id: card.id,
+      columnId: card.phaseId,
+      title: card.title,
+      reference: `#${card.number}`,
+      description: card.description,
+      priority: card.priority,
+      dueDate: card.dueAt ? card.dueAt.toISOString() : null,
+      assignees: assigneesByCard.get(card.id) ?? [],
+    })),
+  };
 }

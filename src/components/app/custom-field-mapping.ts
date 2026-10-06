@@ -30,8 +30,12 @@ export function customFieldToFormField(field: CustomFieldDTO): FormFieldDTO | nu
       return { ...base, type: "checkbox" }
     case "select":
       return { ...base, type: "select", options: field.options ?? [] }
+    case "radio":
+      return { ...base, type: "radio", options: field.options ?? [] }
     case "email":
       return { ...base, type: "email" }
+    case "attachment":
+      return { ...base, type: "file", multiple: true }
     default:
       return null
   }

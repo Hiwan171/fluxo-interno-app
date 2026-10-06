@@ -15,7 +15,7 @@ import {
 } from "lucide-react"
 
 import { KanbanCard } from "@/components/app/kanban-card"
-import type { KanbanColumnDTO } from "@/components/app/types"
+import type { CustomFieldDTO, KanbanColumnDTO } from "@/components/app/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -32,10 +32,11 @@ const topBorderStyles: Record<
   string
 > = {
   neutral: "border-t-muted-foreground/50",
-  teal: "border-t-tag-teal",
-  blue: "border-t-tag-blue",
-  amber: "border-t-tag-amber",
-  rose: "border-t-tag-rose",
+  sky: "border-t-sky-500",
+  red: "border-t-red-600",
+  pink: "border-t-pink-500",
+  purple: "border-t-purple-600",
+  lime: "border-t-lime-600",
 }
 
 const titleColorStyles: Record<
@@ -43,16 +44,20 @@ const titleColorStyles: Record<
   string
 > = {
   neutral: "text-foreground",
-  teal: "text-tag-teal",
-  blue: "text-tag-blue",
-  amber: "text-tag-amber",
-  rose: "text-tag-rose",
+  sky: "text-sky-600",
+  red: "text-red-600",
+  pink: "text-pink-600",
+  purple: "text-purple-600",
+  lime: "text-lime-700",
 }
 
 export interface KanbanColumnProps {
   column: KanbanColumnDTO
   onCardOpen?: (cardId: string) => void
   onCreateCard?: (columnId: string) => void
+  createCardButtonLabel?: string | null
+  customFields?: CustomFieldDTO[]
+  visibleCustomFieldIds?: string[]
   onEditCard?: (cardId: string) => void
   onDuplicateCard?: (cardId: string) => void
   onArchiveCard?: (cardId: string) => void
@@ -70,6 +75,9 @@ export function KanbanColumn({
   column,
   onCardOpen,
   onCreateCard,
+  createCardButtonLabel,
+  customFields,
+  visibleCustomFieldIds,
   onEditCard,
   onDuplicateCard,
   onArchiveCard,
@@ -92,8 +100,12 @@ export function KanbanColumn({
     },
     disabled: !canMoveCards,
   })
+  // O quadro carrega no máximo N cards por fase; `totalCards` é quanto existe
+  // de fato. Mostrar `cards.length` faria a coluna parecer menor do que é.
+  const totalCards = column.totalCards ?? column.cards.length
+  const hiddenCards = Math.max(0, totalCards - column.cards.length)
   const isAtLimit =
-    typeof column.limit === "number" && column.cards.length >= column.limit
+    typeof column.limit === "number" && totalCards >= column.limit
 
   return (
     <section
@@ -121,11 +133,11 @@ export function KanbanColumn({
           className="h-5 min-w-5 px-1.5 font-mono text-[0.65rem]"
           title={
             typeof column.limit === "number"
-              ? `${column.cards.length} de ${column.limit} cards`
-              : `${column.cards.length} cards`
+              ? `${totalCards} de ${column.limit} cards`
+              : `${totalCards} cards`
           }
         >
-          {column.cards.length}
+          {totalCards}
           {typeof column.limit === "number" && `/${column.limit}`}
         </Badge>
         {onCreateCard && (
@@ -207,6 +219,8 @@ export function KanbanColumn({
               onDuplicate={onDuplicateCard}
               onArchive={onArchiveCard}
               disabled={!canMoveCards}
+              customFields={customFields}
+              visibleCustomFieldIds={visibleCustomFieldIds}
             />
           ))}
           {column.cards.length === 0 && (
@@ -221,8 +235,27 @@ export function KanbanColumn({
                 : "Nenhum card nesta etapa"}
             </div>
           )}
+          {hiddenCards > 0 && (
+            <p className="px-1 py-2 text-center text-xs text-muted-foreground">
+              Mais {hiddenCards} card{hiddenCards === 1 ? "" : "s"} nesta etapa.
+              Use os relatórios para ver todos.
+            </p>
+          )}
         </div>
       </SortableContext>
+
+      {column.isInitial && onCreateCard && (
+        <div className="px-2.5 pb-3">
+          <Button
+            type="button"
+            onClick={() => onCreateCard(column.id)}
+            className="w-full rounded-full"
+          >
+            <PlusIcon />
+            {createCardButtonLabel || "Criar novo chamado"}
+          </Button>
+        </div>
+      )}
     </section>
   )
 }

@@ -3,7 +3,9 @@ import type { NextRequest } from "next/server";
 
 const SESSION_COOKIE_NAME = "fluxo_session";
 const PUBLIC_ROUTES = new Set(["/login"]);
-const PUBLIC_PREFIXES = ["/f/"];
+// `/definir-senha/` é alcançada por quem ainda não tem sessão: é o link de
+// convite e o de redefinição. A validade do token é conferida na própria página.
+const PUBLIC_PREFIXES = ["/f/", "/definir-senha/"];
 
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;

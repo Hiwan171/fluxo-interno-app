@@ -6,9 +6,9 @@ import * as schema from "./schema";
 type Database = NodePgDatabase<typeof schema>;
 
 declare global {
-  // eslint-disable-next-line no-var
+   
   var __fluxoPool: Pool | undefined;
-  // eslint-disable-next-line no-var
+   
   var __fluxoDb: Database | undefined;
 }
 

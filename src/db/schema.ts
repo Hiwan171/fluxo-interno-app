@@ -56,12 +56,14 @@ export const fieldTypeEnum = pgEnum("field_type", [
   "datetime",
   "checkbox",
   "select",
+  "radio",
   "multiselect",
   "email",
   "phone",
   "url",
   "currency",
   "user",
+  "attachment",
 ]);
 export const formStatusEnum = pgEnum("form_status", [
   "draft",
@@ -79,10 +81,18 @@ export const messageStatusEnum = pgEnum("message_status", [
   "failed",
   "cancelled",
 ]);
+export const emailAutomationRecipientEnum = pgEnum(
+  "email_automation_recipient",
+  ["requester", "fixed"],
+);
 export const auditResultEnum = pgEnum("audit_result", [
   "success",
   "denied",
   "failure",
+]);
+export const authTokenPurposeEnum = pgEnum("auth_token_purpose", [
+  "invite",
+  "password_reset",
 ]);
 
 const timestamps = {
@@ -165,8 +175,29 @@ export const boards = pgTable(
     visibility: boardVisibilityEnum("visibility")
       .notNull()
       .default("workspace"),
+    createCardButtonLabel: varchar("create_card_button_label", {
+      length: 80,
+    }),
+    expirationMinutes: integer("expiration_minutes"),
+    kanbanVisibleFieldIds: jsonb("kanban_visible_field_ids")
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    onlyAssigneeCanEdit: boolean("only_assignee_can_edit")
+      .notNull()
+      .default(false),
+    onlyManagerCanDeleteCards: boolean("only_manager_can_delete_cards")
+      .notNull()
+      .default(false),
     position: integer("position").notNull().default(0),
     isArchived: boolean("is_archived").notNull().default(false),
+    /**
+     * Contador do número exibido no card (#1, #2, ...). Incrementar esta linha
+     * com `UPDATE ... RETURNING` trava o quadro pela duração da transação, que
+     * é o que serializa duas criações simultâneas. Derivar de `max(number)+1`
+     * não serve: sob READ COMMITTED as duas transações leem o mesmo máximo.
+     */
+    cardSequence: integer("card_sequence").notNull().default(0),
     createdBy: uuid("created_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -230,6 +261,9 @@ export const customFields = pgTable(
     boardId: uuid("board_id")
       .notNull()
       .references(() => boards.id, { onDelete: "cascade" }),
+    phaseId: uuid("phase_id").references(() => phases.id, {
+      onDelete: "cascade",
+    }),
     key: varchar("key", { length: 80 }).notNull(),
     label: varchar("label", { length: 160 }).notNull(),
     description: text("description"),
@@ -249,6 +283,7 @@ export const customFields = pgTable(
       table.boardId,
       table.position,
     ),
+    index("custom_fields_phase_idx").on(table.phaseId),
   ],
 );
 
@@ -327,6 +362,9 @@ export const cards = pgTable(
     phaseId: uuid("phase_id")
       .notNull()
       .references(() => phases.id, { onDelete: "restrict" }),
+    phaseEnteredAt: timestamp("phase_entered_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     number: integer("number").notNull(),
     title: varchar("title", { length: 240 }).notNull(),
     description: text("description"),
@@ -399,6 +437,33 @@ export const cardFieldValues = pgTable(
       table.customFieldId,
     ),
     index("card_field_values_field_idx").on(table.customFieldId),
+  ],
+);
+
+export const attachments = pgTable(
+  "attachments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    cardId: uuid("card_id")
+      .notNull()
+      .references(() => cards.id, { onDelete: "cascade" }),
+    customFieldId: uuid("custom_field_id").references(() => customFields.id, {
+      onDelete: "set null",
+    }),
+    fileName: varchar("file_name", { length: 255 }).notNull(),
+    mimeType: varchar("mime_type", { length: 160 }).notNull(),
+    sizeBytes: integer("size_bytes").notNull(),
+    storageKey: text("storage_key").notNull(),
+    uploadedByUserId: uuid("uploaded_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("attachments_card_idx").on(table.cardId),
+    index("attachments_custom_field_idx").on(table.customFieldId),
   ],
 );
 
@@ -520,6 +585,7 @@ export const emailMessages = pgTable(
     attempts: integer("attempts").notNull().default(0),
     scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
     sentAt: timestamp("sent_at", { withTimezone: true }),
+    readAt: timestamp("read_at", { withTimezone: true }),
     createdBy: uuid("created_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -528,6 +594,42 @@ export const emailMessages = pgTable(
   (table) => [
     index("email_messages_queue_idx").on(table.status, table.scheduledAt),
     index("email_messages_card_idx").on(table.cardId),
+  ],
+);
+
+export const emailAutomations = pgTable(
+  "email_automations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    boardId: uuid("board_id")
+      .notNull()
+      .references(() => boards.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 160 }).notNull(),
+    triggerPhaseId: uuid("trigger_phase_id")
+      .notNull()
+      .references(() => phases.id, { onDelete: "cascade" }),
+    templateId: uuid("template_id")
+      .notNull()
+      .references(() => emailTemplates.id, { onDelete: "cascade" }),
+    recipientType: emailAutomationRecipientEnum("recipient_type")
+      .notNull()
+      .default("requester"),
+    recipientEmails: jsonb("recipient_emails")
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    isActive: boolean("is_active").notNull().default(true),
+    createdBy: uuid("created_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    ...timestamps,
+  },
+  (table) => [
+    index("email_automations_board_idx").on(table.boardId),
+    index("email_automations_trigger_idx").on(table.triggerPhaseId),
   ],
 );
 
@@ -555,6 +657,89 @@ export const sessions = pgTable(
     index("sessions_user_idx").on(table.userId),
     index("sessions_expiry_idx").on(table.expiresAt),
   ],
+);
+
+/**
+ * Convites e redefinições de senha. Guarda apenas o hash do token — o valor em
+ * claro existe só na URL enviada por e-mail, do mesmo jeito que as sessões.
+ * Substitui o envio de senha temporária em texto puro.
+ */
+export const authTokens = pgTable(
+  "auth_tokens",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    tokenHash: char("token_hash", { length: 64 }).notNull(),
+    purpose: authTokenPurposeEnum("purpose").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    createdBy: uuid("created_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("auth_tokens_token_hash_unique").on(table.tokenHash),
+    index("auth_tokens_user_idx").on(table.userId),
+    index("auth_tokens_expiry_idx").on(table.expiresAt),
+  ],
+);
+
+/**
+ * Contadores de rate limit.
+ *
+ * A versão em memória zerava a cada reinício do container e não se propagava
+ * entre réplicas — aceitável numa rede interna, não para o formulário público
+ * exposto na internet, onde reiniciar o processo reabriria a janela.
+ *
+ * A chave primária é (bucket, janela): o `insert ... on conflict do update`
+ * incrementa atomicamente, então dois envios simultâneos não se sobrescrevem.
+ */
+export const rateLimitCounters = pgTable(
+  "rate_limit_counters",
+  {
+    bucket: varchar("bucket", { length: 200 }).notNull(),
+    windowStart: timestamp("window_start", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    hits: integer("hits").notNull().default(0),
+  },
+  (table) => [
+    primaryKey({ columns: [table.bucket, table.windowStart] }),
+    index("rate_limit_counters_expiry_idx").on(table.expiresAt),
+  ],
+);
+
+export const boardReports = pgTable(
+  "board_reports",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    boardId: uuid("board_id")
+      .notNull()
+      .references(() => boards.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 160 }).notNull(),
+    filters: jsonb("filters")
+      .$type<Array<{ fieldId: string; value: string; valueTo: string }>>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    visibleColumns: jsonb("visible_columns")
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    sortField: varchar("sort_field", { length: 80 }).notNull().default("reference"),
+    sortDir: varchar("sort_dir", { length: 4 }).notNull().default("asc"),
+    createdBy: uuid("created_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    ...timestamps,
+  },
+  (table) => [index("board_reports_board_idx").on(table.boardId)],
 );
 
 export const auditLogs = pgTable(
@@ -604,11 +789,16 @@ export type Card = typeof cards.$inferSelect;
 export type CustomField = typeof customFields.$inferSelect;
 export type IntakeForm = typeof intakeForms.$inferSelect;
 export type FormField = typeof formFields.$inferSelect;
+export type Attachment = typeof attachments.$inferSelect;
 export type Comment = typeof comments.$inferSelect;
 export type Event = typeof events.$inferSelect;
 export type EmailTemplate = typeof emailTemplates.$inferSelect;
 export type EmailMessage = typeof emailMessages.$inferSelect;
+export type EmailAutomation = typeof emailAutomations.$inferSelect;
 export type Session = typeof sessions.$inferSelect;
+export type AuthToken = typeof authTokens.$inferSelect;
+export type AuthTokenPurpose = (typeof authTokenPurposeEnum.enumValues)[number];
+export type BoardReport = typeof boardReports.$inferSelect;
 export type AuditLog = typeof auditLogs.$inferSelect;
 export type SystemRole = (typeof systemRoleEnum.enumValues)[number];
 export type WorkspaceRole = (typeof workspaceRoleEnum.enumValues)[number];

@@ -32,11 +32,21 @@ export interface KanbanCardDTO {
   tags?: KanbanTagDTO[]
   assignees?: KanbanAssigneeDTO[]
   emailCount?: number
+  attachmentCount?: number
   checklist?: {
     completed: number
     total: number
   } | null
   customFieldValues?: Record<string, unknown>
+  /** Instante ISO em que o card estoura o prazo da fase, se houver. */
+  phaseDeadline?: string | null
+}
+
+export interface AssignableMemberDTO {
+  userId: string
+  name: string
+  email: string
+  avatarUrl?: string | null
 }
 
 export type CustomFieldType =
@@ -47,12 +57,14 @@ export type CustomFieldType =
   | "datetime"
   | "checkbox"
   | "select"
+  | "radio"
   | "multiselect"
   | "email"
   | "phone"
   | "url"
   | "currency"
   | "user"
+  | "attachment"
 
 export interface CustomFieldDTO {
   id: string
@@ -61,6 +73,17 @@ export interface CustomFieldDTO {
   type: CustomFieldType
   isRequired: boolean
   options?: Array<{ label: string; value: string }>
+  phaseId?: string | null
+}
+
+export interface CardHistoryDTO {
+  id: string
+  type: string
+  metadata: Record<string, unknown>
+  /** Nulo quando a ação veio de um envio anônimo pelo formulário público. */
+  actorName: string | null
+  actorAvatarUrl?: string | null
+  occurredAt: string
 }
 
 export interface CommentDTO {
@@ -75,10 +98,12 @@ export interface CommentDTO {
 export interface EmailMessageDTO {
   id: string
   status: "queued" | "sending" | "sent" | "failed" | "cancelled"
+  fromAddress?: string
   toAddresses: string[]
   subject: string
   textBody?: string | null
   errorMessage?: string | null
+  isAutomated?: boolean
   sentAt?: string | null
   createdAt: string
 }
@@ -86,8 +111,11 @@ export interface EmailMessageDTO {
 export interface KanbanColumnDTO {
   id: string
   title: string
-  accent?: "neutral" | "teal" | "blue" | "amber" | "rose"
+  accent?: "neutral" | "sky" | "red" | "pink" | "purple" | "lime"
   limit?: number | null
+  isInitial?: boolean
+  /** Total real de cards na fase; `cards` traz apenas os carregados. */
+  totalCards?: number
   cards: KanbanCardDTO[]
 }
 
@@ -138,8 +166,30 @@ export interface FormColorFieldDTO extends FormFieldBaseDTO {
   }>
 }
 
+export interface FormIconFieldDTO extends FormFieldBaseDTO {
+  type: "icon"
+  options: Array<{
+    label: string
+    value: string
+  }>
+}
+
+export interface FormRadioFieldDTO extends FormFieldBaseDTO {
+  type: "radio"
+  options: Array<{
+    label: string
+    value: string
+  }>
+}
+
 export interface FormCheckboxFieldDTO extends FormFieldBaseDTO {
   type: "checkbox"
+}
+
+export interface FormFileFieldDTO extends FormFieldBaseDTO {
+  type: "file"
+  multiple?: boolean
+  accept?: string
 }
 
 export type FormFieldDTO =
@@ -148,7 +198,10 @@ export type FormFieldDTO =
   | FormTextareaFieldDTO
   | FormSelectFieldDTO
   | FormColorFieldDTO
+  | FormIconFieldDTO
+  | FormRadioFieldDTO
   | FormCheckboxFieldDTO
+  | FormFileFieldDTO
 
 export type FormInitialValue = string | number | boolean
 

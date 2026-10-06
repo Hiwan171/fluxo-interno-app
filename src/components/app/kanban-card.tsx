@@ -12,14 +12,17 @@ import {
   GripVerticalIcon,
   MailIcon,
   MoreVerticalIcon,
+  PaperclipIcon,
   PencilIcon,
 } from "lucide-react"
 
 import type {
+  CustomFieldDTO,
   KanbanCardDTO,
   KanbanPriority,
   KanbanTagDTO,
 } from "@/components/app/types"
+import { useIsPast } from "@/components/app/use-is-past"
 import {
   Avatar,
   AvatarFallback,
@@ -88,6 +91,25 @@ function isOverdue(value: string) {
   return !Number.isNaN(date.getTime()) && date.getTime() < Date.now()
 }
 
+function formatCardFieldValue(
+  type: CustomFieldDTO["type"],
+  value: unknown,
+  options?: Array<{ label: string; value: string }>
+) {
+  if (value === null || value === undefined || value === "") return "—"
+  if (type === "checkbox") return value === true || value === "true" ? "Sim" : "Não"
+  if ((type === "select" || type === "radio") && options) {
+    return options.find((option) => option.value === value)?.label ?? String(value)
+  }
+  if (type === "attachment") {
+    const files = Array.isArray((value as { files?: unknown } | null)?.files)
+      ? (value as { files: unknown[] }).files
+      : []
+    return files.length > 0 ? `${files.length} anexo(s)` : "—"
+  }
+  return String(value)
+}
+
 export interface KanbanCardProps {
   card: KanbanCardDTO
   onOpen?: (cardId: string) => void
@@ -97,6 +119,8 @@ export interface KanbanCardProps {
   disabled?: boolean
   isOverlay?: boolean
   className?: string
+  customFields?: CustomFieldDTO[]
+  visibleCustomFieldIds?: string[]
 }
 
 export function KanbanCard({
@@ -108,7 +132,10 @@ export function KanbanCard({
   disabled = false,
   isOverlay = false,
   className,
+  customFields,
+  visibleCustomFieldIds,
 }: KanbanCardProps) {
+  const isPhaseExpired = useIsPast(card.phaseDeadline)
   const hasCardMenu = onEdit || onDuplicate || onArchive
   const {
     attributes,
@@ -135,6 +162,14 @@ export function KanbanCard({
     (card.assignees?.length ?? 0) - visibleAssignees.length
   )
   const overdue = Boolean(card.dueDate && isOverdue(card.dueDate))
+  const visibleFields = (visibleCustomFieldIds ?? [])
+    .map((fieldId) => customFields?.find((field) => field.id === fieldId))
+    .filter((field): field is CustomFieldDTO => Boolean(field))
+    .filter((field) => !field.phaseId || field.phaseId === card.columnId)
+    .map((field) => ({
+      field,
+      value: card.customFieldValues?.[field.id],
+    }))
 
   return (
     <Card
@@ -143,12 +178,15 @@ export function KanbanCard({
       size="sm"
       data-dragging={isDragging || undefined}
       className={cn(
-        "relative gap-3 overflow-visible border-l-2 border-l-transparent bg-card py-3 shadow-[0_1px_2px_0_rgb(15_23_42/0.05)] ring-1 ring-foreground/8 transition-[box-shadow,opacity,border-color] hover:shadow-md hover:ring-foreground/12 data-dragging:opacity-35",
+        "relative gap-3 touch-none overflow-visible border-l-2 border-l-transparent bg-card py-3 shadow-[0_1px_2px_0_rgb(15_23_42/0.05)] ring-1 ring-foreground/8 transition-[box-shadow,opacity,border-color] hover:shadow-md hover:ring-foreground/12 data-dragging:opacity-35",
+        !disabled && !isOverlay && "cursor-grab active:cursor-grabbing",
         card.priority === "urgent" && "border-l-priority-urgent",
         card.priority === "high" && "border-l-priority-high",
         isOverlay && "rotate-1 shadow-xl ring-primary/20",
         className
       )}
+      {...attributes}
+      {...listeners}
     >
       <CardHeader className="grid grid-cols-[1fr_auto] gap-2 px-3">
         <div className="min-w-0 space-y-2">
@@ -161,7 +199,7 @@ export function KanbanCard({
             {overdue ? (
               <Badge
                 variant="ghost"
-                className="h-5 gap-1 rounded-full border-0 bg-priority-urgent/15 px-2 text-[0.625rem] font-semibold text-priority-urgent"
+                className="h-5 gap-1 rounded-full border-0 bg-destructive/10 px-2 text-[0.625rem] font-semibold text-destructive"
               >
                 <AlarmClockIcon className="size-3" />
                 Atrasado
@@ -178,6 +216,16 @@ export function KanbanCard({
                   {priorityLabels[card.priority]}
                 </Badge>
               )
+            )}
+            {isPhaseExpired && (
+              <Badge
+                variant="ghost"
+                className="h-5 gap-1 rounded-full border-0 bg-priority-high/15 px-2 text-[0.625rem] font-semibold text-priority-high"
+                title="Este card está parado nesta fase há mais tempo que o configurado"
+              >
+                <AlarmClockIcon className="size-3" />
+                Parado há muito tempo
+              </Badge>
             )}
           </div>
           {onOpen ? (
@@ -237,27 +285,40 @@ export function KanbanCard({
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            className="cursor-grab touch-none text-muted-foreground active:cursor-grabbing"
-            aria-label={`Mover card ${card.title}`}
-            disabled={disabled || isOverlay}
-            {...attributes}
-            {...listeners}
+          <span
+            aria-hidden="true"
+            className="grid size-6 shrink-0 place-items-center text-muted-foreground"
           >
-            <GripVerticalIcon />
-          </Button>
+            <GripVerticalIcon className="size-4" />
+          </span>
         </div>
       </CardHeader>
 
-      {(card.description || (card.tags?.length ?? 0) > 0) && (
+      {(card.description ||
+        (card.tags?.length ?? 0) > 0 ||
+        visibleFields.length > 0) && (
         <CardContent className="space-y-2 px-3">
           {card.description && (
             <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
               {card.description}
             </p>
+          )}
+          {visibleFields.length > 0 && (
+            <dl className="space-y-0.5">
+              {visibleFields.map(({ field, value }) => (
+                <div
+                  key={field.id}
+                  className="flex items-baseline gap-1 text-[0.6875rem] leading-snug"
+                >
+                  <dt className="shrink-0 text-muted-foreground">
+                    {field.label}:
+                  </dt>
+                  <dd className="min-w-0 truncate font-medium">
+                    {formatCardFieldValue(field.type, value, field.options)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
           )}
           {(card.tags?.length ?? 0) > 0 && (
             <div className="flex flex-wrap gap-1">
@@ -293,6 +354,12 @@ export function KanbanCard({
           >
             <CalendarDaysIcon aria-hidden="true" className="size-3.5" />
             {formatDueDate(card.dueDate)}
+          </span>
+        )}
+        {typeof card.attachmentCount === "number" && card.attachmentCount > 0 && (
+          <span className="flex items-center gap-1" title="Anexos">
+            <PaperclipIcon aria-hidden="true" className="size-3.5" />
+            {card.attachmentCount}
           </span>
         )}
         {typeof card.emailCount === "number" && card.emailCount > 0 && (

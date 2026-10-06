@@ -6,7 +6,16 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:seed": "tsx --conditions=react-server scripts/seed.ts",
+    "worker:email": "tsx --conditions=react-server scripts/email-worker.ts",
+    "sweep:attachments": "tsx --conditions=react-server scripts/sweep-attachments.ts",
+    "check:smtp": "tsx --conditions=react-server scripts/check-smtp.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

@@ -13,7 +13,7 @@ import {
 
 export const SESSION_COOKIE_NAME = "fluxo_session";
 
-function useSecureCookie(): boolean {
+function shouldUseSecureCookie(): boolean {
   if (process.env.SESSION_COOKIE_SECURE) {
     return process.env.SESSION_COOKIE_SECURE === "true";
   }
@@ -30,7 +30,7 @@ export async function createUserSession(
 
   cookieStore.set(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: useSecureCookie(),
+    secure: shouldUseSecureCookie(),
     sameSite: "lax",
     path: "/",
     maxAge: SESSION_TTL_SECONDS,

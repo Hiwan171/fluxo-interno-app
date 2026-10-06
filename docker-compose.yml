@@ -3,15 +3,22 @@ name: fluxo-interno
 x-app-environment: &app-environment
   NODE_ENV: production
   TZ: ${TZ:-America/Sao_Paulo}
-  DATABASE_URL: ${DATABASE_URL:?Defina DATABASE_URL no arquivo .env}
-  SESSION_SECRET: ${SESSION_SECRET:?Defina SESSION_SECRET no arquivo .env}
+  # Montada a partir das partes: dentro da rede do compose o host do banco e
+  # `db`. A DATABASE_URL do .env aponta para localhost porque serve ao
+  # `npm run dev` na maquina — reaproveita-la aqui faria o container procurar
+  # o Postgres dentro de si mesmo.
+  DATABASE_URL: postgresql://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:?}
+  APP_URL: ${APP_URL:-}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
   EMAIL_MODE: ${EMAIL_MODE:-log}
   MAIL_FROM: ${MAIL_FROM:-Fluxo Interno <noreply@localhost>}
   SMTP_HOST: ${SMTP_HOST:-mailpit}
   SMTP_PORT: ${SMTP_PORT:-1025}
   SMTP_SECURE: ${SMTP_SECURE:-false}
+  SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-true}
   SMTP_USER: ${SMTP_USER:-}
   SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  UPLOADS_DIR: /app/uploads
 
 services:
   db:
@@ -57,6 +64,7 @@ services:
         condition: service_healthy
     volumes:
       - next_cache:/app/.next/cache
+      - uploads_data:/app/uploads
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -71,12 +79,70 @@ services:
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:3000/').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+          "fetch('http://127.0.0.1:3000/api/health').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
         ]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 20s
+    networks:
+      - backend
+
+  worker:
+    image: ${APP_IMAGE:-fluxo-interno:local}-tooling
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: tooling
+    restart: unless-stopped
+    init: true
+    # `--conditions=react-server` faz o pacote `server-only` resolver para um
+    # modulo vazio; sem isso ele lanca ao ser importado fora do Next.
+    command:
+      ["node_modules/.bin/tsx", "--conditions=react-server", "scripts/email-worker.ts"]
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks:
+      - backend
+
+  caddy:
+    image: caddy:2-alpine
+    profiles:
+      - prod
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Defina APP_DOMAIN no arquivo .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Guarda os certificados do Let's Encrypt entre reinicios. Sem este
+      # volume o Caddy pede certificado novo a cada subida e bate no limite de
+      # emissao da autoridade.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    # Necessario para escutar em 80 e 443 sem rodar como root.
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
     networks:
       - backend
 
@@ -132,8 +198,11 @@ services:
 
 volumes:
   postgres_data:
+  caddy_data:
+  caddy_config:
   next_cache:
   mailpit_data:
+  uploads_data:
 
 networks:
   backend:

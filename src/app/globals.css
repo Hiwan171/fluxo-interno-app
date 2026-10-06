@@ -64,8 +64,8 @@
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.546 0.226 262.881);
-  --primary-foreground: oklch(0.985 0 0);
+  --primary: #2563eb;
+  --primary-foreground: #ffffff;
   --secondary: oklch(0.97 0 0);
   --secondary-foreground: oklch(0.205 0 0);
   --muted: oklch(0.97 0 0);
@@ -96,10 +96,15 @@
   --tag-blue: oklch(0.546 0.245 262.881);
   --tag-amber: oklch(0.666 0.179 58.318);
   --tag-rose: oklch(0.586 0.253 17.585);
-  --priority-low: oklch(0.627 0.194 149.214);
-  --priority-medium: oklch(0.546 0.245 262.881);
-  --priority-high: oklch(0.646 0.222 41.116);
-  --priority-urgent: oklch(0.577 0.245 27.325);
+  /* Rampa de severidade: verde -> âmbar -> laranja -> vermelho. A ordem
+     precisa ser lida sem legenda, então a cor tem que escalar junto com a
+     urgência — o roxo e o preto de antes não comunicavam ordem nenhuma.
+     Todos os quatro passam de 4.5:1 sobre fundo claro (o texto do chip tem
+     10px em peso semibold, o pior caso do sistema). */
+  --priority-low: #15803d;
+  --priority-medium: #b45309;
+  --priority-high: #c2410c;
+  --priority-urgent: #b91c1c;
 }
 
 .dark {
@@ -109,8 +114,8 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.623 0.214 259.815);
-  --primary-foreground: oklch(0.985 0 0);
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
   --secondary: oklch(0.269 0 0);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0 0);
@@ -140,10 +145,11 @@
   --tag-blue: oklch(0.623 0.214 259.815);
   --tag-amber: oklch(0.769 0.188 70.08);
   --tag-rose: oklch(0.645 0.246 16.439);
-  --priority-low: oklch(0.696 0.17 162.48);
-  --priority-medium: oklch(0.623 0.214 259.815);
-  --priority-high: oklch(0.705 0.213 47.604);
-  --priority-urgent: oklch(0.704 0.191 22.216);
+  /* Mesma rampa, clareada para manter o contraste sobre o card escuro. */
+  --priority-low: #4ade80;
+  --priority-medium: #fbbf24;
+  --priority-high: #fb923c;
+  --priority-urgent: #f87171;
 }
 
 @layer base {

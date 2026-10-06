@@ -2,19 +2,35 @@ import "server-only";
 
 import { randomBytes } from "node:crypto";
 
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  ilike,
+  inArray,
+  isNotNull,
+  isNull,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 
 import { getDb, type Database } from "@/db";
 import {
+  attachments,
+  auditLogs,
   boardMembers,
+  boardReports,
   boards,
   cardAssignees,
   cardFieldValues,
   cards,
   comments,
   customFields,
+  emailAutomations,
   emailMessages,
+  emailTemplates,
   formFields,
   intakeForms,
   phases,
@@ -24,18 +40,46 @@ import {
   type BoardMemberRole,
   type WorkspaceRole,
 } from "@/db/schema";
-import { getCurrentSession, hashPassword, type AuthSession } from "@/lib/auth";
+import { buildAppLink } from "@/lib/app-url";
+import type { UploadedFileMeta } from "@/lib/attachments";
+import {
+  getCurrentSession,
+  hashPassword,
+  issueAuthToken,
+  revokeAllUserSessions,
+  type AuthSession,
+} from "@/lib/auth";
 import { sendWorkflowEmail } from "@/lib/email";
+import { renderEmailTemplate } from "@/lib/email-template";
+import {
+  CARD_EVENT_TYPES,
+  listCardEvents,
+  recordCardEvent,
+  recordCardEventSafely,
+} from "@/lib/events";
+import {
+  normalizeFieldValues,
+  type FieldDefinition,
+} from "@/lib/field-values";
+import { logger } from "@/lib/logger";
+import {
+  queryReportCards,
+  type ReportPage,
+  type ReportQueryInput,
+} from "@/lib/report-query";
 import {
   createBoardSchema,
+  createWorkspaceSchema,
   createCardSchema,
   createCommentSchema,
   createCustomFieldSchema,
+  createEmailTemplateSchema,
   createFormFieldSchema,
   createIntakeFormSchema,
   createPhaseSchema,
   emailSchema,
   moveCardSchema,
+  updateBoardSchema,
   updateCardSchema,
   updateCustomFieldSchema,
   updateFormFieldSchema,
@@ -46,9 +90,11 @@ import {
   type CreateCardInput,
   type CreateCommentInput,
   type CreateCustomFieldInput,
+  type CreateWorkspaceInput,
   type CreateFormFieldInput,
   type CreateIntakeFormInput,
   type CreatePhaseInput,
+  type UpdateBoardInput,
   type UpdateFormFieldInput,
   type UpdateCardInput,
   type UpdateCustomFieldInput,
@@ -64,6 +110,24 @@ const WORKSPACE_ROLE_WEIGHT: Record<WorkspaceRole, number> = {
 };
 
 export type BoardAccess = "view" | "edit" | "manage";
+
+/**
+ * Estados que continuam ocupando lugar no quadro.
+ *
+ * Um card numa fase final é `completed` mas segue visível na coluna — só
+ * `archived` sai de cena. Filtrar apenas por `active`, como era antes de a fase
+ * final passar a valer, faria o card sumir ao ser concluído.
+ */
+export const BOARD_VISIBLE_STATUSES = ["active", "completed"] as const;
+
+/**
+ * Teto de cards carregados por fase no quadro.
+ *
+ * Ninguém lê um kanban além das primeiras dezenas de cards de uma coluna — o
+ * que passa disso é trabalho para o relatório, que tem filtro e paginação. Sem
+ * teto, a página crescia com o quadro inteiro e travava o navegador.
+ */
+export const BOARD_PHASE_CARD_LIMIT = 100;
 
 export class AuthenticationError extends Error {
   readonly status = 401;
@@ -216,6 +280,11 @@ export type BoardAccessResult = {
     icon: string | null;
     visibility: "workspace" | "private";
     isArchived: boolean;
+    createCardButtonLabel: string | null;
+    expirationMinutes: number | null;
+    kanbanVisibleFieldIds: string[];
+    onlyAssigneeCanEdit: boolean;
+    onlyManagerCanDeleteCards: boolean;
   };
   workspaceRole: WorkspaceRole;
   boardRole: BoardMemberRole | null;
@@ -239,6 +308,11 @@ export async function requireBoardAccess(
       icon: boards.icon,
       visibility: boards.visibility,
       isArchived: boards.isArchived,
+      createCardButtonLabel: boards.createCardButtonLabel,
+      expirationMinutes: boards.expirationMinutes,
+      kanbanVisibleFieldIds: boards.kanbanVisibleFieldIds,
+      onlyAssigneeCanEdit: boards.onlyAssigneeCanEdit,
+      onlyManagerCanDeleteCards: boards.onlyManagerCanDeleteCards,
     })
     .from(boards)
     .where(eq(boards.id, boardId))
@@ -309,6 +383,51 @@ export async function requireBoardAccess(
   }
 
   return { board, workspaceRole, boardRole, access, session };
+}
+
+/**
+ * Cria um espaço de trabalho e coloca quem criou como proprietário.
+ *
+ * Só administradores do sistema criam workspaces: é a fronteira de isolamento
+ * de dados da aplicação, não algo que qualquer membro deva multiplicar.
+ */
+export async function createWorkspaceForCurrentUser(
+  input: CreateWorkspaceInput,
+) {
+  const parsed = createWorkspaceSchema.parse(input);
+  const session = await requireSystemAdmin();
+
+  return getDb().transaction(async (tx) => {
+    const [existing] = await tx
+      .select({ id: workspaces.id })
+      .from(workspaces)
+      .where(eq(workspaces.slug, parsed.slug))
+      .limit(1);
+
+    if (existing) {
+      throw new ConflictError("Já existe um espaço de trabalho com este slug.");
+    }
+
+    const [created] = await tx
+      .insert(workspaces)
+      .values({
+        name: parsed.name,
+        slug: parsed.slug,
+        timezone: parsed.timezone,
+        createdBy: session.userId,
+      })
+      .returning();
+
+    // Sem esta linha o criador não enxergaria o próprio workspace na lista, que
+    // é montada a partir das associações.
+    await tx.insert(workspaceMembers).values({
+      workspaceId: created.id,
+      userId: session.userId,
+      role: "owner",
+    });
+
+    return created;
+  });
 }
 
 export async function listWorkspacesForCurrentUser() {
@@ -415,7 +534,7 @@ export async function listWorkspaceBoards(workspaceId: string) {
           cards.boardId,
           boardRows.map((board) => board.id),
         ),
-        eq(cards.status, "active"),
+        inArray(cards.status, BOARD_VISIBLE_STATUSES),
       ),
     )
     .groupBy(cards.boardId);
@@ -465,6 +584,51 @@ export async function createBoardForCurrentUser(input: CreateBoardInput) {
   });
 }
 
+export async function updateBoardForCurrentUser(
+  boardId: string,
+  input: UpdateBoardInput,
+) {
+  const parsed = updateBoardSchema.parse(input);
+  await requireBoardAccess(boardId, "manage");
+
+  const [updated] = await getDb()
+    .update(boards)
+    .set({
+      ...(parsed.name !== undefined ? { name: parsed.name } : {}),
+      ...(parsed.color !== undefined ? { color: parsed.color } : {}),
+      ...(parsed.description !== undefined
+        ? { description: parsed.description }
+        : {}),
+      ...(parsed.icon !== undefined ? { icon: parsed.icon } : {}),
+      ...(parsed.visibility !== undefined
+        ? { visibility: parsed.visibility }
+        : {}),
+      ...(parsed.createCardButtonLabel !== undefined
+        ? { createCardButtonLabel: parsed.createCardButtonLabel }
+        : {}),
+      ...(parsed.expirationMinutes !== undefined
+        ? { expirationMinutes: parsed.expirationMinutes }
+        : {}),
+      ...(parsed.kanbanVisibleFieldIds !== undefined
+        ? { kanbanVisibleFieldIds: parsed.kanbanVisibleFieldIds }
+        : {}),
+      ...(parsed.onlyAssigneeCanEdit !== undefined
+        ? { onlyAssigneeCanEdit: parsed.onlyAssigneeCanEdit }
+        : {}),
+      ...(parsed.onlyManagerCanDeleteCards !== undefined
+        ? { onlyManagerCanDeleteCards: parsed.onlyManagerCanDeleteCards }
+        : {}),
+    })
+    .where(eq(boards.id, boardId))
+    .returning();
+
+  if (!updated) {
+    throw new ResourceNotFoundError("Quadro não encontrado.");
+  }
+
+  return updated;
+}
+
 export async function getBoardSnapshot(boardId: string) {
   const { board } = await requireBoardAccess(boardId, "view");
 
@@ -474,10 +638,36 @@ export async function getBoardSnapshot(boardId: string) {
       .from(phases)
       .where(eq(phases.boardId, boardId))
       .orderBy(asc(phases.position)),
+    // `row_number` corta por fase em vez de por quadro: uma coluna cheia não
+    // pode consumir a cota das outras, que era o efeito de um `limit` simples.
     getDb()
       .select()
       .from(cards)
-      .where(and(eq(cards.boardId, boardId), eq(cards.status, "active")))
+      .where(
+        and(
+          eq(cards.boardId, boardId),
+          inArray(cards.status, BOARD_VISIBLE_STATUSES),
+          inArray(
+            cards.id,
+            getDb()
+              .select({ id: sql<string>`ranked.id` })
+              .from(
+                sql`(
+                  select
+                    id,
+                    row_number() over (
+                      partition by phase_id
+                      order by position asc, number asc
+                    ) as rn
+                  from cards
+                  where board_id = ${boardId}
+                    and status in ('active', 'completed')
+                ) ranked`,
+              )
+              .where(sql`ranked.rn <= ${BOARD_PHASE_CARD_LIMIT}`),
+          ),
+        ),
+      )
       .orderBy(asc(cards.phaseId), asc(cards.position), asc(cards.number)),
     getDb()
       .select()
@@ -503,7 +693,7 @@ export async function getBoardSnapshot(boardId: string) {
   ]);
 
   const cardIds = boardCards.map((card) => card.id);
-  const [assignees, fieldValues] = cardIds.length
+  const [assignees, fieldValues, emailCounts] = cardIds.length
     ? await Promise.all([
         getDb()
           .select({
@@ -523,8 +713,51 @@ export async function getBoardSnapshot(boardId: string) {
           })
           .from(cardFieldValues)
           .where(inArray(cardFieldValues.cardId, cardIds)),
+        getDb()
+          .select({
+            cardId: emailMessages.cardId,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(emailMessages)
+          .where(inArray(emailMessages.cardId, cardIds))
+          .groupBy(emailMessages.cardId),
       ])
-    : [[], []];
+    : [[], [], []];
+
+  const attachmentIds = fieldValues.flatMap((row) => {
+    const value = row.value as { attachmentIds?: unknown } | null;
+    return Array.isArray(value?.attachmentIds)
+      ? (value.attachmentIds as string[])
+      : [];
+  });
+
+  const boardAttachments = attachmentIds.length
+    ? await getDb()
+        .select({
+          id: attachments.id,
+          fileName: attachments.fileName,
+          mimeType: attachments.mimeType,
+          sizeBytes: attachments.sizeBytes,
+        })
+        .from(attachments)
+        .where(inArray(attachments.id, attachmentIds))
+    : [];
+
+  // Total real por fase, independente do teto de carregamento. A coluna precisa
+  // dizer "50 de 340" em vez de mentir que existem só 50.
+  const phaseTotals = await getDb()
+    .select({
+      phaseId: cards.phaseId,
+      total: sql<number>`count(*)::int`,
+    })
+    .from(cards)
+    .where(
+      and(
+        eq(cards.boardId, boardId),
+        inArray(cards.status, BOARD_VISIBLE_STATUSES),
+      ),
+    )
+    .groupBy(cards.phaseId);
 
   return {
     board,
@@ -534,7 +767,100 @@ export async function getBoardSnapshot(boardId: string) {
     forms: boardForms,
     assignees,
     fieldValues,
+    attachments: boardAttachments,
+    emailCounts,
+    phaseTotals,
+    phaseCardLimit: BOARD_PHASE_CARD_LIMIT,
   };
+}
+
+/** Teto de resultados da busca no quadro. */
+const BOARD_SEARCH_LIMIT = 300;
+
+/**
+ * Busca cards do quadro inteiro por título, número ou solicitante.
+ *
+ * O kanban carrega no máximo `BOARD_PHASE_CARD_LIMIT` cards por fase, então
+ * filtrar no navegador só encontraria o que já estava à vista — quem procurasse
+ * um card antigo concluiria que ele não existe.
+ */
+export async function searchBoardCardsForCurrentUser(
+  boardId: string,
+  query: string,
+) {
+  await requireBoardAccess(boardId, "view");
+
+  const term = query.trim();
+
+  if (term.length < 2) return { cards: [], assignees: [] };
+
+  const pattern = `%${term}%`;
+  const asNumber = Number(term.replace("#", ""));
+
+  const matches = await getDb()
+    .select()
+    .from(cards)
+    .where(
+      and(
+        eq(cards.boardId, boardId),
+        inArray(cards.status, BOARD_VISIBLE_STATUSES),
+        or(
+          ilike(cards.title, pattern),
+          ilike(cards.requesterName, pattern),
+          ilike(cards.requesterEmail, pattern),
+          ...(Number.isFinite(asNumber) ? [eq(cards.number, asNumber)] : []),
+        ),
+      ),
+    )
+    .orderBy(asc(cards.phaseId), asc(cards.position), asc(cards.number))
+    .limit(BOARD_SEARCH_LIMIT);
+
+  if (matches.length === 0) return { cards: [], assignees: [] };
+
+  // Os responsáveis vêm junto porque o card do kanban os exibe; sem eles o
+  // resultado da busca apareceria visualmente diferente do quadro normal.
+  const assignees = await getDb()
+    .select({
+      cardId: cardAssignees.cardId,
+      userId: users.id,
+      name: users.name,
+      avatarUrl: users.avatarUrl,
+    })
+    .from(cardAssignees)
+    .innerJoin(users, eq(users.id, cardAssignees.userId))
+    .where(
+      inArray(
+        cardAssignees.cardId,
+        matches.map((card) => card.id),
+      ),
+    );
+
+  return { cards: matches, assignees };
+}
+
+export async function getAttachmentForDownload(attachmentId: string) {
+  const [row] = await getDb()
+    .select({
+      id: attachments.id,
+      cardId: attachments.cardId,
+      fileName: attachments.fileName,
+      mimeType: attachments.mimeType,
+      sizeBytes: attachments.sizeBytes,
+      storageKey: attachments.storageKey,
+      boardId: cards.boardId,
+    })
+    .from(attachments)
+    .innerJoin(cards, eq(cards.id, attachments.cardId))
+    .where(eq(attachments.id, attachmentId))
+    .limit(1);
+
+  if (!row) {
+    throw new ResourceNotFoundError("Anexo não encontrado.");
+  }
+
+  await requireBoardAccess(row.boardId, "view");
+
+  return row;
 }
 
 export async function getWorkspaceSummary(workspaceId: string) {
@@ -576,7 +902,12 @@ export async function moveCardForCurrentUser(input: {
   const { cardId, destinationPhaseId, position } = moveCardSchema.parse(input);
 
   const [card] = await getDb()
-    .select({ id: cards.id, boardId: cards.boardId, phaseId: cards.phaseId })
+    .select({
+      id: cards.id,
+      workspaceId: cards.workspaceId,
+      boardId: cards.boardId,
+      phaseId: cards.phaseId,
+    })
     .from(cards)
     .where(eq(cards.id, cardId))
     .limit(1);
@@ -585,10 +916,16 @@ export async function moveCardForCurrentUser(input: {
     throw new ResourceNotFoundError("Card não encontrado.");
   }
 
-  await requireBoardAccess(card.boardId, "edit");
+  const { session } = await requireBoardAccess(card.boardId, "edit");
 
   const [destinationPhase] = await getDb()
-    .select({ id: phases.id, boardId: phases.boardId })
+    .select({
+      id: phases.id,
+      boardId: phases.boardId,
+      name: phases.name,
+      cardLimit: phases.cardLimit,
+      isFinal: phases.isFinal,
+    })
     .from(phases)
     .where(eq(phases.id, destinationPhaseId))
     .limit(1);
@@ -597,11 +934,16 @@ export async function moveCardForCurrentUser(input: {
     throw new ResourceNotFoundError("Etapa não encontrada neste quadro.");
   }
 
+  const changedPhase = card.phaseId !== destinationPhaseId;
+
   await getDb().transaction(async (tx) => {
     const affectedPhaseIds = Array.from(
       new Set([card.phaseId, destinationPhaseId]),
     );
 
+    // `for update` trava as linhas das fases envolvidas até o fim da
+    // transação. Sem isso, dois arrastes simultâneos liam a mesma ordem e
+    // gravavam posições duplicadas por cima um do outro.
     const rows = await tx
       .select({
         id: cards.id,
@@ -612,11 +954,24 @@ export async function moveCardForCurrentUser(input: {
       .where(
         and(
           eq(cards.boardId, card.boardId),
-          eq(cards.status, "active"),
+          inArray(cards.status, BOARD_VISIBLE_STATUSES),
           inArray(cards.phaseId, affectedPhaseIds),
         ),
       )
-      .orderBy(asc(cards.phaseId), asc(cards.position));
+      .orderBy(asc(cards.phaseId), asc(cards.position))
+      .for("update");
+
+    if (changedPhase && destinationPhase.cardLimit != null) {
+      const occupied = rows.filter(
+        (row) => row.phaseId === destinationPhaseId,
+      ).length;
+
+      if (occupied >= destinationPhase.cardLimit) {
+        throw new ConflictError(
+          `A fase "${destinationPhase.name}" atingiu o limite de ${destinationPhase.cardLimit} cards.`,
+        );
+      }
+    }
 
     const byPhase = new Map<string, typeof rows>();
     for (const row of rows) {
@@ -637,12 +992,9 @@ export async function moveCardForCurrentUser(input: {
         position: clamped,
       });
 
-      for (const [index, row] of sourceList.entries()) {
-        await tx
-          .update(cards)
-          .set({ position: index, phaseId: destinationPhaseId })
-          .where(eq(cards.id, row.id));
-      }
+      await applyCardPositions(tx, [
+        { phaseId: destinationPhaseId, ids: sourceList.map((row) => row.id) },
+      ]);
       return;
     }
 
@@ -654,16 +1006,237 @@ export async function moveCardForCurrentUser(input: {
       position: clamped,
     });
 
-    for (const [index, row] of sourceList.entries()) {
-      await tx.update(cards).set({ position: index }).where(eq(cards.id, row.id));
-    }
-    for (const [index, row] of destinationList.entries()) {
-      await tx
-        .update(cards)
-        .set({ position: index, phaseId: destinationPhaseId })
-        .where(eq(cards.id, row.id));
-    }
+    await applyCardPositions(tx, [
+      { phaseId: card.phaseId, ids: sourceList.map((row) => row.id) },
+      { phaseId: destinationPhaseId, ids: destinationList.map((row) => row.id) },
+    ]);
+
+    await tx
+      .update(cards)
+      .set({
+        phaseEnteredAt: new Date(),
+        updatedBy: session.userId,
+        // Entrar numa fase final conclui o card; sair dela o reabre.
+        ...(destinationPhase.isFinal
+          ? { status: "completed" as const, completedAt: new Date() }
+          : { status: "active" as const, completedAt: null }),
+      })
+      .where(eq(cards.id, cardId));
   });
+
+  if (!changedPhase) return;
+
+  const [previousPhase] = await getDb()
+    .select({ name: phases.name })
+    .from(phases)
+    .where(eq(phases.id, card.phaseId))
+    .limit(1);
+
+  await recordCardEventSafely({
+    workspaceId: card.workspaceId,
+    boardId: card.boardId,
+    cardId,
+    actorId: session.userId,
+    type: CARD_EVENT_TYPES.moved,
+    metadata: {
+      fromPhaseId: card.phaseId,
+      fromPhaseName: previousPhase?.name ?? null,
+      toPhaseId: destinationPhaseId,
+      toPhaseName: destinationPhase.name,
+    },
+  });
+
+  if (destinationPhase.isFinal) {
+    await recordCardEventSafely({
+      workspaceId: card.workspaceId,
+      boardId: card.boardId,
+      cardId,
+      actorId: session.userId,
+      type: CARD_EVENT_TYPES.completed,
+      metadata: { phaseName: destinationPhase.name },
+    });
+  }
+
+  // Só enfileira. O envio acontece no worker — manter o SMTP no caminho do
+  // arrastar-e-soltar travava a interface enquanto o servidor de e-mail
+  // respondia, e uma falha virava apenas uma linha de log.
+  try {
+    await enqueuePhaseEmailAutomations(cardId, card.boardId, destinationPhaseId);
+  } catch (error) {
+    logger.error("email.automation.enqueue_failed", error, {
+      cardId,
+      boardId: card.boardId,
+      phaseId: destinationPhaseId,
+    });
+  }
+}
+
+function formatCardFieldValueForEmail(
+  type: string,
+  value: unknown,
+  options?: Array<{ label: string; value: string }>,
+): string {
+  if (value === null || value === undefined || value === "") return "";
+
+  if (type === "checkbox") {
+    return value === true || value === "true" ? "Sim" : "Não";
+  }
+
+  if ((type === "select" || type === "radio") && options) {
+    return options.find((option) => option.value === value)?.label ?? String(value);
+  }
+
+  if (type === "attachment") {
+    const files = Array.isArray((value as { files?: unknown } | null)?.files)
+      ? (value as { files: Array<{ fileName: string }> }).files
+      : [];
+    return files.map((file) => file.fileName).join(", ");
+  }
+
+  if (typeof value === "object") return "";
+
+  return String(value);
+}
+
+async function buildCardFieldEmailContext(
+  cardId: string,
+): Promise<Record<string, string>> {
+  const rows = await getDb()
+    .select({
+      key: customFields.key,
+      type: customFields.type,
+      config: customFields.config,
+      value: cardFieldValues.value,
+    })
+    .from(cardFieldValues)
+    .innerJoin(customFields, eq(customFields.id, cardFieldValues.customFieldId))
+    .where(eq(cardFieldValues.cardId, cardId));
+
+  const context: Record<string, string> = {};
+  for (const row of rows) {
+    const options = Array.isArray((row.config as { options?: unknown })?.options)
+      ? (row.config as { options: Array<{ label: string; value: string }> }).options
+      : undefined;
+    context[`campo.${row.key}`] = formatCardFieldValueForEmail(
+      row.type,
+      row.value,
+      options,
+    );
+  }
+
+  return context;
+}
+
+async function enqueuePhaseEmailAutomations(
+  cardId: string,
+  boardId: string,
+  phaseId: string,
+) {
+  const automations = await getDb()
+    .select({
+      id: emailAutomations.id,
+      templateId: emailAutomations.templateId,
+      recipientType: emailAutomations.recipientType,
+      recipientEmails: emailAutomations.recipientEmails,
+    })
+    .from(emailAutomations)
+    .where(
+      and(
+        eq(emailAutomations.boardId, boardId),
+        eq(emailAutomations.triggerPhaseId, phaseId),
+        eq(emailAutomations.isActive, true),
+      ),
+    );
+
+  if (automations.length === 0) return;
+
+  const [card] = await getDb()
+    .select({
+      id: cards.id,
+      number: cards.number,
+      title: cards.title,
+      requesterName: cards.requesterName,
+      requesterEmail: cards.requesterEmail,
+      workspaceId: cards.workspaceId,
+    })
+    .from(cards)
+    .where(eq(cards.id, cardId))
+    .limit(1);
+
+  if (!card) return;
+
+  const [phase] = await getDb()
+    .select({ name: phases.name })
+    .from(phases)
+    .where(eq(phases.id, phaseId))
+    .limit(1);
+
+  const templates = await getDb()
+    .select()
+    .from(emailTemplates)
+    .where(
+      inArray(
+        emailTemplates.id,
+        automations.map((automation) => automation.templateId),
+      ),
+    );
+  const templateById = new Map(templates.map((template) => [template.id, template]));
+
+  const fieldContext = await buildCardFieldEmailContext(cardId);
+  const context = {
+    card_title: card.title,
+    card_reference: `#${card.number}`,
+    requester_name: card.requesterName ?? "",
+    phase_name: phase?.name ?? "",
+    ...fieldContext,
+  };
+
+  const fromAddress = process.env.MAIL_FROM ?? "Fluxo Interno <noreply@localhost>";
+
+  const queued: string[] = [];
+
+  for (const automation of automations) {
+    const template = templateById.get(automation.templateId);
+    if (!template || !template.isActive) continue;
+
+    const toAddresses =
+      automation.recipientType === "fixed"
+        ? automation.recipientEmails
+        : card.requesterEmail
+          ? [card.requesterEmail]
+          : [];
+    if (toAddresses.length === 0) continue;
+
+    // Grava como `queued`: a coluna, o `scheduledAt` e o indice de fila ja
+    // existiam no schema desde o inicio e nunca haviam sido usados.
+    const [record] = await getDb()
+      .insert(emailMessages)
+      .values({
+        workspaceId: card.workspaceId,
+        cardId: card.id,
+        templateId: template.id,
+        direction: "outbound",
+        status: "queued",
+        scheduledAt: new Date(),
+        fromAddress,
+        toAddresses,
+        subject: renderEmailTemplate(template.subject, context),
+        textBody: template.textBody
+          ? renderEmailTemplate(template.textBody, context)
+          : null,
+      })
+      .returning({ id: emailMessages.id });
+
+    queued.push(record.id);
+  }
+
+  if (queued.length > 0) {
+    logger.info("email.automation.enqueued", {
+      cardId,
+      phaseId,
+      count: queued.length,
+    });
+  }
 }
 
 export async function createCardForCurrentUser(input: CreateCardInput) {
@@ -674,7 +1247,13 @@ export async function createCardForCurrentUser(input: CreateCardInput) {
   );
 
   const [phase] = await getDb()
-    .select({ id: phases.id, boardId: phases.boardId })
+    .select({
+      id: phases.id,
+      boardId: phases.boardId,
+      name: phases.name,
+      cardLimit: phases.cardLimit,
+      isFinal: phases.isFinal,
+    })
     .from(phases)
     .where(eq(phases.id, parsed.phaseId))
     .limit(1);
@@ -684,16 +1263,15 @@ export async function createCardForCurrentUser(input: CreateCardInput) {
   }
 
   return getDb().transaction(async (tx) => {
-    const [numberRow] = await tx
-      .select({ value: sql<number>`coalesce(max(${cards.number}), 0) + 1` })
-      .from(cards)
-      .where(eq(cards.boardId, board.id));
+    await assertPhaseHasRoom(tx, phase.id, phase.name, phase.cardLimit);
+
+    const number = await nextCardNumber(tx, board.id);
 
     const [countRow] = await tx
       .select({ value: sql<number>`count(*)::int` })
       .from(cards)
       .where(
-        and(eq(cards.phaseId, parsed.phaseId), eq(cards.status, "active")),
+        and(eq(cards.phaseId, parsed.phaseId), inArray(cards.status, BOARD_VISIBLE_STATUSES)),
       );
 
     const [created] = await tx
@@ -702,7 +1280,7 @@ export async function createCardForCurrentUser(input: CreateCardInput) {
         workspaceId: board.workspaceId,
         boardId: board.id,
         phaseId: parsed.phaseId,
-        number: numberRow.value,
+        number,
         title: parsed.title,
         description: parsed.description ?? null,
         priority: parsed.priority,
@@ -710,6 +1288,11 @@ export async function createCardForCurrentUser(input: CreateCardInput) {
         requesterName: parsed.requesterName ?? null,
         requesterEmail: parsed.requesterEmail ?? null,
         dueAt: parsed.dueAt ?? null,
+        // Criar direto numa fase final já nasce concluído; o status
+        // `completed` do enum era inalcançável antes disto.
+        ...(phase.isFinal
+          ? { status: "completed" as const, completedAt: new Date() }
+          : {}),
         source: parsed.source,
         sourceFormId: parsed.sourceFormId ?? null,
         createdBy: session.userId,
@@ -717,7 +1300,19 @@ export async function createCardForCurrentUser(input: CreateCardInput) {
       })
       .returning();
 
-    await upsertCardFieldValues(tx, created.id, parsed.fieldValues);
+    await upsertCardFieldValues(tx, board.id, created.id, parsed.fieldValues);
+
+    await recordCardEvent(
+      {
+        workspaceId: board.workspaceId,
+        boardId: board.id,
+        cardId: created.id,
+        actorId: session.userId,
+        type: CARD_EVENT_TYPES.created,
+        metadata: { phaseName: phase.name, source: parsed.source },
+      },
+      tx,
+    );
 
     return created;
   });
@@ -725,15 +1320,129 @@ export async function createCardForCurrentUser(input: CreateCardInput) {
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
+type PendingAttachmentValue = {
+  kind: "attachment";
+  files: UploadedFileMeta[];
+};
+
+function isPendingAttachmentValue(
+  value: unknown,
+): value is PendingAttachmentValue {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { kind?: unknown }).kind === "attachment"
+  );
+}
+
+async function resolveFieldValueForStorage(
+  tx: Tx,
+  cardId: string,
+  customFieldId: string,
+  rawValue: unknown,
+) {
+  if (!isPendingAttachmentValue(rawValue)) return rawValue;
+
+  if (rawValue.files.length === 0) return { attachmentIds: [] };
+
+  const inserted = await tx
+    .insert(attachments)
+    .values(
+      rawValue.files.map((file) => ({
+        cardId,
+        customFieldId,
+        fileName: file.fileName,
+        mimeType: file.mimeType,
+        sizeBytes: file.sizeBytes,
+        storageKey: file.storageKey,
+      })),
+    )
+    .returning({ id: attachments.id });
+
+  return { attachmentIds: inserted.map((row) => row.id) };
+}
+
+/**
+ * Reescreve posição e fase de vários cards num único comando.
+ *
+ * A versão anterior emitia um `UPDATE` por card em laço: mover um card no topo
+ * de uma fase com 200 cards custava 200 idas ao banco dentro da transação, com
+ * as linhas travadas o tempo todo.
+ */
+async function applyCardPositions(
+  tx: Tx,
+  groups: Array<{ phaseId: string; ids: string[] }>,
+) {
+  const rows = groups.flatMap((group) =>
+    group.ids.map((id, index) => ({
+      id,
+      position: index,
+      phaseId: group.phaseId,
+    })),
+  );
+
+  if (rows.length === 0) return;
+
+  const values = sql.join(
+    rows.map(
+      (row) =>
+        sql`(${row.id}::uuid, ${row.position}::integer, ${row.phaseId}::uuid)`,
+    ),
+    sql`, `,
+  );
+
+  await tx.execute(sql`
+    update cards as c
+    set position = v.position, phase_id = v.phase_id
+    from (values ${values}) as v(id, position, phase_id)
+    where c.id = v.id
+  `);
+}
+
+/** Carrega as definições dos campos ativos de um quadro. */
+async function loadBoardFieldDefinitions(
+  executor: Tx | Database,
+  boardId: string,
+): Promise<FieldDefinition[]> {
+  return executor
+    .select({
+      id: customFields.id,
+      label: customFields.label,
+      type: customFields.type,
+      config: customFields.config,
+      isRequired: customFields.isRequired,
+    })
+    .from(customFields)
+    .where(
+      and(eq(customFields.boardId, boardId), eq(customFields.isArchived, false)),
+    );
+}
+
+/**
+ * Grava os valores de campo depois de validá-los contra as definições do quadro
+ * a que o card pertence. As definições vêm do banco dentro da mesma transação —
+ * confiar no que o formulário mandou permitiria escrever em campos de outro
+ * quadro e gravar qualquer coisa em qualquer tipo.
+ */
 async function upsertCardFieldValues(
   tx: Tx,
+  boardId: string,
   cardId: string,
   fieldValues: Record<string, unknown>,
 ) {
   const entries = Object.entries(fieldValues);
   if (entries.length === 0) return;
 
-  for (const [customFieldId, value] of entries) {
+  const definitions = await loadBoardFieldDefinitions(tx, boardId);
+  const normalized = normalizeFieldValues(definitions, fieldValues);
+
+  for (const [customFieldId, normalizedValue] of Object.entries(normalized)) {
+    const value = await resolveFieldValueForStorage(
+      tx,
+      cardId,
+      customFieldId,
+      normalizedValue,
+    );
     await tx
       .insert(cardFieldValues)
       .values({ cardId, customFieldId, value })
@@ -741,6 +1450,50 @@ async function upsertCardFieldValues(
         target: [cardFieldValues.cardId, cardFieldValues.customFieldId],
         set: { value },
       });
+  }
+}
+
+/**
+ * Reserva o próximo número do quadro incrementando o contador da linha.
+ * O `UPDATE ... RETURNING` trava a linha até o fim da transação, o que
+ * serializa criações concorrentes — `max(number) + 1` devolvia o mesmo valor
+ * para duas transações simultâneas e a segunda violava a unicidade.
+ */
+async function nextCardNumber(tx: Tx, boardId: string): Promise<number> {
+  const [row] = await tx
+    .update(boards)
+    .set({ cardSequence: sql`${boards.cardSequence} + 1` })
+    .where(eq(boards.id, boardId))
+    .returning({ value: boards.cardSequence });
+
+  if (!row) {
+    throw new ResourceNotFoundError("Quadro não encontrado.");
+  }
+
+  return row.value;
+}
+
+/**
+ * Recusa a entrada quando a fase já atingiu o limite configurado.
+ * O limite era salvo e exibido, mas nada o aplicava.
+ */
+async function assertPhaseHasRoom(
+  tx: Tx,
+  phaseId: string,
+  phaseName: string,
+  cardLimit: number | null,
+) {
+  if (cardLimit == null) return;
+
+  const [row] = await tx
+    .select({ value: sql<number>`count(*)::int` })
+    .from(cards)
+    .where(and(eq(cards.phaseId, phaseId), inArray(cards.status, BOARD_VISIBLE_STATUSES)));
+
+  if ((row?.value ?? 0) >= cardLimit) {
+    throw new ConflictError(
+      `A fase "${phaseName}" atingiu o limite de ${cardLimit} cards.`,
+    );
   }
 }
 
@@ -896,7 +1649,23 @@ export async function updateCardForCurrentUser(
     throw new ResourceNotFoundError("Card não encontrado.");
   }
 
-  const { session } = await requireBoardAccess(card.boardId, "edit");
+  const { session, board, workspaceRole, boardRole } = await requireBoardAccess(
+    card.boardId,
+    "edit",
+  );
+
+  const isExemptFromAssigneeRule =
+    session.user.systemRole === "admin" ||
+    workspaceRole === "owner" ||
+    workspaceRole === "admin" ||
+    boardRole === "manager";
+
+  if (board.onlyAssigneeCanEdit && !isExemptFromAssigneeRule) {
+    const assignee = await isCardAssignee(session.userId, cardId);
+    if (!assignee) {
+      throw new AuthorizationError();
+    }
+  }
 
   return getDb().transaction(async (tx) => {
     const [updated] = await tx
@@ -922,8 +1691,20 @@ export async function updateCardForCurrentUser(
       .returning();
 
     if (parsed.fieldValues) {
-      await upsertCardFieldValues(tx, cardId, parsed.fieldValues);
+      await upsertCardFieldValues(tx, card.boardId, cardId, parsed.fieldValues);
     }
+
+    await recordCardEvent(
+      {
+        workspaceId: board.workspaceId,
+        boardId: card.boardId,
+        cardId,
+        actorId: session.userId,
+        type: CARD_EVENT_TYPES.updated,
+        metadata: { fields: Object.keys(parsed) },
+      },
+      tx,
+    );
 
     return updated;
   });
@@ -943,16 +1724,13 @@ export async function duplicateCardForCurrentUser(cardId: string) {
   const { session } = await requireBoardAccess(original.boardId, "edit");
 
   return getDb().transaction(async (tx) => {
-    const [numberRow] = await tx
-      .select({ value: sql<number>`coalesce(max(${cards.number}), 0) + 1` })
-      .from(cards)
-      .where(eq(cards.boardId, original.boardId));
+    const number = await nextCardNumber(tx, original.boardId);
 
     const [countRow] = await tx
       .select({ value: sql<number>`count(*)::int` })
       .from(cards)
       .where(
-        and(eq(cards.phaseId, original.phaseId), eq(cards.status, "active")),
+        and(eq(cards.phaseId, original.phaseId), inArray(cards.status, BOARD_VISIBLE_STATUSES)),
       );
 
     const [created] = await tx
@@ -961,7 +1739,7 @@ export async function duplicateCardForCurrentUser(cardId: string) {
         workspaceId: original.workspaceId,
         boardId: original.boardId,
         phaseId: original.phaseId,
-        number: numberRow.value,
+        number,
         title: `${original.title} (cópia)`,
         description: original.description,
         priority: original.priority,
@@ -974,6 +1752,55 @@ export async function duplicateCardForCurrentUser(cardId: string) {
         updatedBy: session.userId,
       })
       .returning();
+
+    // Copiar só o "casco" do card tornava a duplicação quase inútil: o valor
+    // dela está em não reprencher o formulário inteiro.
+    const originalValues = await tx
+      .select({
+        customFieldId: cardFieldValues.customFieldId,
+        value: cardFieldValues.value,
+      })
+      .from(cardFieldValues)
+      .where(eq(cardFieldValues.cardId, cardId));
+
+    if (originalValues.length > 0) {
+      await tx.insert(cardFieldValues).values(
+        originalValues.map((row) => ({
+          cardId: created.id,
+          customFieldId: row.customFieldId,
+          // Os anexos são referenciados pelo mesmo id, não duplicados em
+          // disco — é o comportamento do Pipefy e evita inflar o volume.
+          value: row.value,
+        })),
+      );
+    }
+
+    const originalAssignees = await tx
+      .select({ userId: cardAssignees.userId })
+      .from(cardAssignees)
+      .where(eq(cardAssignees.cardId, cardId));
+
+    if (originalAssignees.length > 0) {
+      await tx.insert(cardAssignees).values(
+        originalAssignees.map((row) => ({
+          cardId: created.id,
+          userId: row.userId,
+          assignedBy: session.userId,
+        })),
+      );
+    }
+
+    await recordCardEvent(
+      {
+        workspaceId: original.workspaceId,
+        boardId: original.boardId,
+        cardId: created.id,
+        actorId: session.userId,
+        type: CARD_EVENT_TYPES.created,
+        metadata: { duplicatedFromCardId: cardId, duplicatedFromNumber: original.number },
+      },
+      tx,
+    );
 
     return created;
   });
@@ -990,12 +1817,24 @@ export async function archiveCardForCurrentUser(cardId: string) {
     throw new ResourceNotFoundError("Card não encontrado.");
   }
 
-  await requireBoardAccess(card.boardId, "edit");
+  const { board, session } = await requireBoardAccess(card.boardId, "edit");
+
+  if (board.onlyManagerCanDeleteCards) {
+    await requireBoardAccess(card.boardId, "manage");
+  }
 
   await getDb()
     .update(cards)
     .set({ status: "archived", archivedAt: new Date() })
     .where(eq(cards.id, cardId));
+
+  await recordCardEventSafely({
+    workspaceId: board.workspaceId,
+    boardId: card.boardId,
+    cardId,
+    actorId: session.userId,
+    type: CARD_EVENT_TYPES.archived,
+  });
 }
 
 async function requireCardBoardAccess(cardId: string, access: BoardAccess) {
@@ -1016,7 +1855,7 @@ async function requireCardBoardAccess(cardId: string, access: BoardAccess) {
 export async function getCardActivityForCurrentUser(cardId: string) {
   await requireCardBoardAccess(cardId, "view");
 
-  const [cardComments, cardEmails] = await Promise.all([
+  const [cardComments, cardEmails, cardHistory] = await Promise.all([
     getDb()
       .select({
         id: comments.id,
@@ -1035,20 +1874,435 @@ export async function getCardActivityForCurrentUser(cardId: string) {
       .select({
         id: emailMessages.id,
         status: emailMessages.status,
+        fromAddress: emailMessages.fromAddress,
         toAddresses: emailMessages.toAddresses,
         ccAddresses: emailMessages.ccAddresses,
         subject: emailMessages.subject,
         textBody: emailMessages.textBody,
         errorMessage: emailMessages.errorMessage,
+        templateId: emailMessages.templateId,
         sentAt: emailMessages.sentAt,
         createdAt: emailMessages.createdAt,
       })
       .from(emailMessages)
       .where(eq(emailMessages.cardId, cardId))
       .orderBy(desc(emailMessages.createdAt)),
+    listCardEvents(cardId),
   ]);
 
-  return { comments: cardComments, emails: cardEmails };
+  return { comments: cardComments, emails: cardEmails, history: cardHistory };
+}
+
+export async function listEmailsForBoard(boardId: string) {
+  await requireBoardAccess(boardId, "view");
+
+  const [rows, assigneeRows] = await Promise.all([
+    getDb()
+      .select({
+        id: emailMessages.id,
+        status: emailMessages.status,
+        fromAddress: emailMessages.fromAddress,
+        toAddresses: emailMessages.toAddresses,
+        subject: emailMessages.subject,
+        textBody: emailMessages.textBody,
+        errorMessage: emailMessages.errorMessage,
+        sentAt: emailMessages.sentAt,
+        createdAt: emailMessages.createdAt,
+        readAt: emailMessages.readAt,
+        cardId: cards.id,
+        cardNumber: cards.number,
+        cardTitle: cards.title,
+        cardPhaseId: cards.phaseId,
+        requesterName: cards.requesterName,
+        requesterEmail: cards.requesterEmail,
+      })
+      .from(emailMessages)
+      .innerJoin(cards, eq(cards.id, emailMessages.cardId))
+      .where(eq(cards.boardId, boardId))
+      .orderBy(desc(emailMessages.createdAt)),
+    getDb()
+      .select({ cardId: cardAssignees.cardId, userId: cardAssignees.userId })
+      .from(cardAssignees)
+      .innerJoin(cards, eq(cards.id, cardAssignees.cardId))
+      .where(eq(cards.boardId, boardId)),
+  ]);
+
+  const assigneesByCard = new Map<string, string[]>();
+  for (const row of assigneeRows) {
+    const list = assigneesByCard.get(row.cardId) ?? [];
+    list.push(row.userId);
+    assigneesByCard.set(row.cardId, list);
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    assigneeUserIds: assigneesByCard.get(row.cardId) ?? [],
+  }));
+}
+
+export async function markEmailReadForCurrentUser(emailId: string) {
+  const [email] = await getDb()
+    .select({ id: emailMessages.id, cardId: emailMessages.cardId, readAt: emailMessages.readAt })
+    .from(emailMessages)
+    .where(eq(emailMessages.id, emailId))
+    .limit(1);
+
+  if (!email) {
+    throw new ResourceNotFoundError("E-mail não encontrado.");
+  }
+
+  if (email.cardId) {
+    await requireCardBoardAccess(email.cardId, "view");
+  }
+
+  if (email.readAt) return;
+
+  await getDb()
+    .update(emailMessages)
+    .set({ readAt: new Date() })
+    .where(eq(emailMessages.id, emailId));
+}
+
+export async function listEmailTemplatesForBoard(boardId: string) {
+  await requireBoardAccess(boardId, "view");
+
+  return getDb()
+    .select()
+    .from(emailTemplates)
+    .where(eq(emailTemplates.boardId, boardId))
+    .orderBy(asc(emailTemplates.name));
+}
+
+function slugifyTemplateKey(label: string) {
+  const cleaned = label
+    .toLocaleLowerCase("pt-BR")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const base = /^[a-z]/.test(cleaned) ? cleaned : `template_${cleaned}`;
+
+  return `${(base || "template").slice(0, 60)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export async function createEmailTemplateForCurrentUser(input: {
+  boardId: string;
+  name: string;
+  subject: string;
+  textBody: string;
+}) {
+  const { board, session } = await requireBoardAccess(input.boardId, "view");
+
+  const parsed = createEmailTemplateSchema.parse({
+    workspaceId: board.workspaceId,
+    boardId: board.id,
+    key: slugifyTemplateKey(input.name),
+    name: input.name,
+    subject: input.subject,
+    textBody: input.textBody,
+    isActive: true,
+  });
+
+  const [created] = await getDb()
+    .insert(emailTemplates)
+    .values({
+      workspaceId: parsed.workspaceId,
+      boardId: parsed.boardId,
+      key: parsed.key,
+      name: parsed.name,
+      subject: parsed.subject,
+      textBody: parsed.textBody ?? null,
+      htmlBody: parsed.htmlBody ?? null,
+      isActive: parsed.isActive,
+      createdBy: session.userId,
+    })
+    .returning();
+
+  return created;
+}
+
+export async function updateEmailTemplateForCurrentUser(
+  templateId: string,
+  input: { name?: string; subject?: string; textBody?: string; isActive?: boolean },
+) {
+  const [template] = await getDb()
+    .select({ id: emailTemplates.id, boardId: emailTemplates.boardId })
+    .from(emailTemplates)
+    .where(eq(emailTemplates.id, templateId))
+    .limit(1);
+
+  if (!template || !template.boardId) {
+    throw new ResourceNotFoundError("Template não encontrado.");
+  }
+
+  await requireBoardAccess(template.boardId, "view");
+
+  const [updated] = await getDb()
+    .update(emailTemplates)
+    .set({
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.subject !== undefined ? { subject: input.subject } : {}),
+      ...(input.textBody !== undefined ? { textBody: input.textBody } : {}),
+      ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
+    })
+    .where(eq(emailTemplates.id, templateId))
+    .returning();
+
+  return updated;
+}
+
+export async function deleteEmailTemplateForCurrentUser(templateId: string) {
+  const [template] = await getDb()
+    .select({ id: emailTemplates.id, boardId: emailTemplates.boardId })
+    .from(emailTemplates)
+    .where(eq(emailTemplates.id, templateId))
+    .limit(1);
+
+  if (!template || !template.boardId) {
+    throw new ResourceNotFoundError("Template não encontrado.");
+  }
+
+  await requireBoardAccess(template.boardId, "view");
+
+  await getDb().delete(emailTemplates).where(eq(emailTemplates.id, templateId));
+}
+
+export async function listEmailAutomationsForBoard(boardId: string) {
+  await requireBoardAccess(boardId, "view");
+
+  return getDb()
+    .select({
+      id: emailAutomations.id,
+      name: emailAutomations.name,
+      triggerPhaseId: emailAutomations.triggerPhaseId,
+      triggerPhaseName: phases.name,
+      templateId: emailAutomations.templateId,
+      templateName: emailTemplates.name,
+      recipientType: emailAutomations.recipientType,
+      recipientEmails: emailAutomations.recipientEmails,
+      isActive: emailAutomations.isActive,
+      createdAt: emailAutomations.createdAt,
+    })
+    .from(emailAutomations)
+    .innerJoin(phases, eq(phases.id, emailAutomations.triggerPhaseId))
+    .innerJoin(emailTemplates, eq(emailTemplates.id, emailAutomations.templateId))
+    .where(eq(emailAutomations.boardId, boardId))
+    .orderBy(asc(emailAutomations.name));
+}
+
+export async function createEmailAutomationForCurrentUser(input: {
+  boardId: string;
+  name: string;
+  triggerPhaseId: string;
+  templateId: string;
+  recipientEmails?: string[];
+}) {
+  const { board, session } = await requireBoardAccess(input.boardId, "view");
+
+  const [phase] = await getDb()
+    .select({ id: phases.id, boardId: phases.boardId })
+    .from(phases)
+    .where(eq(phases.id, input.triggerPhaseId))
+    .limit(1);
+  if (!phase || phase.boardId !== board.id) {
+    throw new ResourceNotFoundError("Fase não encontrada neste quadro.");
+  }
+
+  const [template] = await getDb()
+    .select({ id: emailTemplates.id, boardId: emailTemplates.boardId })
+    .from(emailTemplates)
+    .where(eq(emailTemplates.id, input.templateId))
+    .limit(1);
+  if (!template || template.boardId !== board.id) {
+    throw new ResourceNotFoundError("Template não encontrado neste quadro.");
+  }
+
+  const recipientEmails = (input.recipientEmails ?? []).filter(Boolean);
+  const recipientType = recipientEmails.length > 0 ? "fixed" : "requester";
+
+  const [created] = await getDb()
+    .insert(emailAutomations)
+    .values({
+      workspaceId: board.workspaceId,
+      boardId: board.id,
+      name: input.name,
+      triggerPhaseId: input.triggerPhaseId,
+      templateId: input.templateId,
+      recipientType,
+      recipientEmails,
+      createdBy: session.userId,
+    })
+    .returning();
+
+  return created;
+}
+
+export async function updateEmailAutomationForCurrentUser(
+  automationId: string,
+  input: { isActive?: boolean },
+) {
+  const [automation] = await getDb()
+    .select({ id: emailAutomations.id, boardId: emailAutomations.boardId })
+    .from(emailAutomations)
+    .where(eq(emailAutomations.id, automationId))
+    .limit(1);
+
+  if (!automation) {
+    throw new ResourceNotFoundError("Automação não encontrada.");
+  }
+
+  await requireBoardAccess(automation.boardId, "view");
+
+  const [updated] = await getDb()
+    .update(emailAutomations)
+    .set({
+      ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
+    })
+    .where(eq(emailAutomations.id, automationId))
+    .returning();
+
+  return updated;
+}
+
+export async function deleteEmailAutomationForCurrentUser(automationId: string) {
+  const [automation] = await getDb()
+    .select({ id: emailAutomations.id, boardId: emailAutomations.boardId })
+    .from(emailAutomations)
+    .where(eq(emailAutomations.id, automationId))
+    .limit(1);
+
+  if (!automation) {
+    throw new ResourceNotFoundError("Automação não encontrada.");
+  }
+
+  await requireBoardAccess(automation.boardId, "view");
+
+  await getDb().delete(emailAutomations).where(eq(emailAutomations.id, automationId));
+}
+
+/**
+ * Página de um relatório, com filtro, ordenação e paginação resolvidos no
+ * banco. Substituiu o carregamento integral do quadro seguido de filtragem no
+ * navegador.
+ */
+export async function queryReportCardsForCurrentUser(
+  boardId: string,
+  input: ReportQueryInput,
+): Promise<ReportPage> {
+  await requireBoardAccess(boardId, "view");
+
+  return queryReportCards(boardId, input);
+}
+
+export async function countAllCardsForBoard(boardId: string) {
+  await requireBoardAccess(boardId, "view");
+
+  const [row] = await getDb()
+    .select({ value: sql<number>`count(*)::int` })
+    .from(cards)
+    .where(eq(cards.boardId, boardId));
+
+  return row.value;
+}
+
+export async function listBoardReports(boardId: string) {
+  await requireBoardAccess(boardId, "view");
+
+  return getDb()
+    .select()
+    .from(boardReports)
+    .where(eq(boardReports.boardId, boardId))
+    .orderBy(asc(boardReports.name));
+}
+
+export async function getBoardReportForCurrentUser(reportId: string) {
+  const [report] = await getDb()
+    .select()
+    .from(boardReports)
+    .where(eq(boardReports.id, reportId))
+    .limit(1);
+
+  if (!report) {
+    throw new ResourceNotFoundError("Relatório não encontrado.");
+  }
+
+  await requireBoardAccess(report.boardId, "view");
+
+  return report;
+}
+
+export async function createBoardReportForCurrentUser(input: {
+  boardId: string;
+  name: string;
+}) {
+  const { board, session } = await requireBoardAccess(input.boardId, "view");
+
+  const [created] = await getDb()
+    .insert(boardReports)
+    .values({
+      workspaceId: board.workspaceId,
+      boardId: board.id,
+      name: input.name,
+      createdBy: session.userId,
+    })
+    .returning();
+
+  return created;
+}
+
+export async function updateBoardReportForCurrentUser(
+  reportId: string,
+  input: {
+    name?: string;
+    filters?: Array<{ fieldId: string; value: string; valueTo: string }>;
+    visibleColumns?: string[];
+    sortField?: string;
+    sortDir?: "asc" | "desc";
+  },
+) {
+  const [report] = await getDb()
+    .select({ id: boardReports.id, boardId: boardReports.boardId })
+    .from(boardReports)
+    .where(eq(boardReports.id, reportId))
+    .limit(1);
+
+  if (!report) {
+    throw new ResourceNotFoundError("Relatório não encontrado.");
+  }
+
+  await requireBoardAccess(report.boardId, "view");
+
+  const [updated] = await getDb()
+    .update(boardReports)
+    .set({
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.filters !== undefined ? { filters: input.filters } : {}),
+      ...(input.visibleColumns !== undefined
+        ? { visibleColumns: input.visibleColumns }
+        : {}),
+      ...(input.sortField !== undefined ? { sortField: input.sortField } : {}),
+      ...(input.sortDir !== undefined ? { sortDir: input.sortDir } : {}),
+    })
+    .where(eq(boardReports.id, reportId))
+    .returning();
+
+  return updated;
+}
+
+export async function deleteBoardReportForCurrentUser(reportId: string) {
+  const [report] = await getDb()
+    .select({ id: boardReports.id, boardId: boardReports.boardId })
+    .from(boardReports)
+    .where(eq(boardReports.id, reportId))
+    .limit(1);
+
+  if (!report) {
+    throw new ResourceNotFoundError("Relatório não encontrado.");
+  }
+
+  await requireBoardAccess(report.boardId, "view");
+
+  await getDb().delete(boardReports).where(eq(boardReports.id, reportId));
 }
 
 export async function createCommentForCurrentUser(input: CreateCommentInput) {
@@ -1123,6 +2377,17 @@ export async function createCustomFieldForCurrentUser(
   const parsed = createCustomFieldSchema.parse(input);
   const { board } = await requireBoardAccess(parsed.boardId, "manage");
 
+  if (parsed.phaseId) {
+    const [phase] = await getDb()
+      .select({ id: phases.id, boardId: phases.boardId })
+      .from(phases)
+      .where(eq(phases.id, parsed.phaseId))
+      .limit(1);
+    if (!phase || phase.boardId !== board.id) {
+      throw new ResourceNotFoundError("Fase não encontrada neste quadro.");
+    }
+  }
+
   return getDb().transaction(async (tx) => {
     const [countRow] = await tx
       .select({ value: sql<number>`count(*)::int` })
@@ -1133,6 +2398,7 @@ export async function createCustomFieldForCurrentUser(
       .insert(customFields)
       .values({
         boardId: board.id,
+        phaseId: parsed.phaseId ?? null,
         key: parsed.key,
         label: parsed.label,
         description: parsed.description ?? null,
@@ -1202,6 +2468,158 @@ export async function archiveCustomFieldForCurrentUser(fieldId: string) {
     .where(eq(customFields.id, fieldId));
 }
 
+/** Visão de todos os workspaces com contagens, para a tela de administração. */
+export async function listAllWorkspacesForCurrentUser() {
+  await requireSystemAdmin();
+
+  const [rows, memberCounts, boardCounts] = await Promise.all([
+    getDb()
+      .select({
+        id: workspaces.id,
+        name: workspaces.name,
+        slug: workspaces.slug,
+      })
+      .from(workspaces)
+      .orderBy(asc(workspaces.name)),
+    getDb()
+      .select({
+        workspaceId: workspaceMembers.workspaceId,
+        value: sql<number>`count(*)::int`,
+      })
+      .from(workspaceMembers)
+      .groupBy(workspaceMembers.workspaceId),
+    getDb()
+      .select({
+        workspaceId: boards.workspaceId,
+        value: sql<number>`count(*)::int`,
+      })
+      .from(boards)
+      .groupBy(boards.workspaceId),
+  ]);
+
+  const membersByWorkspace = new Map(
+    memberCounts.map((row) => [row.workspaceId, row.value]),
+  );
+  const boardsByWorkspace = new Map(
+    boardCounts.map((row) => [row.workspaceId, row.value]),
+  );
+
+  return rows.map((row) => ({
+    ...row,
+    memberCount: membersByWorkspace.get(row.id) ?? 0,
+    boardCount: boardsByWorkspace.get(row.id) ?? 0,
+  }));
+}
+
+export async function listSystemUsersForCurrentUser() {
+  await requireSystemAdmin();
+
+  return getDb()
+    .select({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+      avatarUrl: users.avatarUrl,
+      systemRole: users.systemRole,
+      isActive: users.isActive,
+      lastLoginAt: users.lastLoginAt,
+      createdAt: users.createdAt,
+    })
+    .from(users)
+    .orderBy(asc(users.name));
+}
+
+/**
+ * Ativa ou desativa uma conta.
+ *
+ * Desativar precisa derrubar as sessões: `readStoredSession` já exige
+ * `isActive`, mas o cookie continuaria válido até a próxima leitura e a pessoa
+ * seguiria navegando em páginas já renderizadas.
+ */
+export async function setUserActiveForCurrentUser(
+  userId: string,
+  isActive: boolean,
+) {
+  const session = await requireSystemAdmin();
+
+  if (session.userId === userId && !isActive) {
+    throw new ConflictError("Você não pode desativar a sua própria conta.");
+  }
+
+  const [updated] = await getDb()
+    .update(users)
+    .set({ isActive })
+    .where(eq(users.id, userId))
+    .returning({ id: users.id, email: users.email });
+
+  if (!updated) {
+    throw new ResourceNotFoundError("Usuário não encontrado.");
+  }
+
+  if (!isActive) {
+    await revokeAllUserSessions(userId);
+  }
+
+  await getDb().insert(auditLogs).values({
+    actorId: session.userId,
+    action: isActive ? "user.activated" : "user.deactivated",
+    entityType: "user",
+    entityId: userId,
+    result: "success",
+    details: { email: updated.email },
+  });
+}
+
+/**
+ * Promove ou rebaixa um administrador do sistema.
+ *
+ * O papel `admin` ignora toda a autorização por workspace, então o mesmo
+ * cuidado do nível de workspace vale aqui: ninguém altera o próprio papel, e o
+ * sistema não pode ficar sem nenhum administrador.
+ */
+export async function setUserSystemRoleForCurrentUser(
+  userId: string,
+  systemRole: "admin" | "user",
+) {
+  const session = await requireSystemAdmin();
+
+  if (session.userId === userId) {
+    throw new ConflictError("Você não pode alterar o seu próprio papel.");
+  }
+
+  if (systemRole === "user") {
+    const [row] = await getDb()
+      .select({ value: sql<number>`count(*)::int` })
+      .from(users)
+      .where(and(eq(users.systemRole, "admin"), eq(users.isActive, true)));
+
+    if ((row?.value ?? 0) <= 1) {
+      throw new ConflictError(
+        "Este é o último administrador ativo do sistema e não pode ser rebaixado.",
+      );
+    }
+  }
+
+  const [updated] = await getDb()
+    .update(users)
+    .set({ systemRole })
+    .where(eq(users.id, userId))
+    .returning({ id: users.id, email: users.email });
+
+  if (!updated) {
+    throw new ResourceNotFoundError("Usuário não encontrado.");
+  }
+
+  await getDb().insert(auditLogs).values({
+    actorId: session.userId,
+    action: "user.system_role_changed",
+    entityType: "user",
+    entityId: userId,
+    result: "success",
+    details: { email: updated.email, systemRole },
+  });
+}
+
 export async function listWorkspaceMembersForCurrentUser(workspaceId: string) {
   await requireWorkspaceRole(workspaceId, "admin");
 
@@ -1232,24 +2650,26 @@ export async function addWorkspaceMemberForCurrentUser(
   input: { email: string; name: string; role: WorkspaceRole },
 ) {
   const parsed = addWorkspaceMemberInputSchema.parse(input);
-  const { workspace } = await requireWorkspaceRole(workspaceId, "admin");
+  const { workspace, session } = await requireWorkspaceRole(workspaceId, "admin");
   const email = parsed.email;
 
   let [user] = await getDb().select().from(users).where(eq(users.email, email)).limit(1);
-  let temporaryPassword: string | null = null;
+  let isNewUser = false;
 
   if (!user) {
-    temporaryPassword = randomBytes(9).toString("base64url");
-    const passwordHash = await hashPassword(temporaryPassword);
+    // A conta nasce sem senha utilizável: o hash é de um valor aleatório que
+    // ninguém conhece, então o único caminho de entrada é o link do convite.
+    const unusablePassword = await hashPassword(randomBytes(32).toString("base64url"));
     [user] = await getDb()
       .insert(users)
       .values({
         email,
         name: parsed.name,
-        passwordHash,
+        passwordHash: unusablePassword,
         systemRole: "user",
       })
       .returning();
+    isNewUser = true;
   }
 
   const [existingMembership] = await getDb()
@@ -1271,34 +2691,145 @@ export async function addWorkspaceMemberForCurrentUser(
     .insert(workspaceMembers)
     .values({ workspaceId, userId: user.id, role: parsed.role });
 
-  if (temporaryPassword) {
+  if (isNewUser) {
+    const { token } = await issueAuthToken(user.id, "invite", session.userId);
+    const inviteUrl = await buildAppLink(`/definir-senha/${token}`);
+
     await sendWorkflowEmail({
       to: [user.email],
-      subjectTemplate: "Você foi adicionado ao espaço {{workspace}}",
+      subjectTemplate: "Seu acesso ao espaço {{workspace}}",
       bodyTemplate:
-        "Olá {{name}},\n\nVocê agora tem acesso ao espaço de trabalho \"{{workspace}}\" no Fluxo Interno.\n\nE-mail: {{email}}\nSenha temporária: {{password}}\n\nFaça login e considere trocar sua senha.",
+        'Olá {{name}},\n\nVocê agora tem acesso ao espaço de trabalho "{{workspace}}" no Fluxo Interno.\n\nDefina sua senha por este link:\n{{link}}\n\nO link vale por 7 dias e só pode ser usado uma vez. Se não foi você que pediu este acesso, ignore esta mensagem.',
       context: {
         name: user.name,
         workspace: workspace.name,
-        email: user.email,
-        password: temporaryPassword,
+        link: inviteUrl,
       },
     }).catch(() => {});
   }
 
-  return { user, temporaryPassword };
+  return { user, isNewUser };
 }
 
+/**
+ * Gera um link de redefinição para outro membro. Substitui o antigo hábito de
+ * o administrador definir uma senha e comunicá-la — aqui ninguém, nem quem
+ * administra, chega a conhecer a senha do outro.
+ */
+export async function issuePasswordResetForMemberForCurrentUser(
+  workspaceId: string,
+  userId: string,
+) {
+  const { session } = await requireWorkspaceRole(workspaceId, "admin");
+
+  const membership = await getWorkspaceMembership(workspaceId, userId);
+
+  if (!membership) {
+    throw new ResourceNotFoundError(
+      "Este usuário não é membro deste espaço de trabalho.",
+    );
+  }
+
+  const [user] = await getDb()
+    .select({ id: users.id, name: users.name, email: users.email })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  if (!user) {
+    throw new ResourceNotFoundError("Usuário não encontrado.");
+  }
+
+  const { token } = await issueAuthToken(user.id, "password_reset", session.userId);
+  const resetUrl = await buildAppLink(`/definir-senha/${token}`);
+
+  await sendWorkflowEmail({
+    to: [user.email],
+    subjectTemplate: "Redefinição de senha do Fluxo Interno",
+    bodyTemplate:
+      "Olá {{name}},\n\nFoi solicitada uma redefinição de senha para a sua conta.\n\nDefina uma nova senha por este link:\n{{link}}\n\nO link vale por 2 horas e só pode ser usado uma vez. Se não foi você, ignore esta mensagem — sua senha atual continua valendo.",
+    context: { name: user.name, link: resetUrl },
+  }).catch(() => {});
+
+  return { email: user.email };
+}
+
+const workspaceRoleSchema = z.enum(["owner", "admin", "member", "viewer"]);
+
+async function getWorkspaceMembership(workspaceId: string, userId: string) {
+  const [row] = await getDb()
+    .select({ role: workspaceMembers.role })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+      ),
+    )
+    .limit(1);
+
+  return row ?? null;
+}
+
+async function countWorkspaceOwners(workspaceId: string) {
+  const [row] = await getDb()
+    .select({ value: sql<number>`count(*)::int` })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.role, "owner"),
+      ),
+    );
+
+  return row?.value ?? 0;
+}
+
+/**
+ * Conceder ou retirar `owner` é privativo de um owner (ou do admin de sistema).
+ * Sem isso, um admin de workspace se promoveria sozinho — e poderia rebaixar
+ * quem o promoveu.
+ */
 export async function updateWorkspaceMemberRoleForCurrentUser(
   workspaceId: string,
   userId: string,
   role: WorkspaceRole,
 ) {
-  await requireWorkspaceRole(workspaceId, "admin");
+  const nextRole = workspaceRoleSchema.parse(role);
+  const { session, role: actorRole, isSystemAdmin } =
+    await requireWorkspaceRole(workspaceId, "admin");
+
+  if (session.userId === userId && !isSystemAdmin) {
+    throw new ConflictError("Você não pode alterar o seu próprio papel.");
+  }
+
+  const target = await getWorkspaceMembership(workspaceId, userId);
+
+  if (!target) {
+    throw new ResourceNotFoundError(
+      "Este usuário não é membro deste espaço de trabalho.",
+    );
+  }
+
+  if (target.role === nextRole) return;
+
+  const touchesOwner = nextRole === "owner" || target.role === "owner";
+
+  if (touchesOwner && !isSystemAdmin && actorRole !== "owner") {
+    throw new AuthorizationError(
+      "Apenas um proprietário pode conceder ou retirar o papel de proprietário.",
+    );
+  }
+
+  if (target.role === "owner" && (await countWorkspaceOwners(workspaceId)) <= 1) {
+    throw new ConflictError(
+      "Este é o último proprietário do espaço de trabalho. Promova outro membro antes de alterar este papel.",
+    );
+  }
 
   await getDb()
     .update(workspaceMembers)
-    .set({ role })
+    .set({ role: nextRole })
     .where(
       and(
         eq(workspaceMembers.workspaceId, workspaceId),
@@ -1311,7 +2842,8 @@ export async function removeWorkspaceMemberForCurrentUser(
   workspaceId: string,
   userId: string,
 ) {
-  const { session } = await requireWorkspaceRole(workspaceId, "admin");
+  const { session, role: actorRole, isSystemAdmin } =
+    await requireWorkspaceRole(workspaceId, "admin");
 
   if (session.userId === userId) {
     throw new ConflictError(
@@ -1319,14 +2851,69 @@ export async function removeWorkspaceMemberForCurrentUser(
     );
   }
 
-  await getDb()
-    .delete(workspaceMembers)
-    .where(
-      and(
-        eq(workspaceMembers.workspaceId, workspaceId),
-        eq(workspaceMembers.userId, userId),
-      ),
-    );
+  const target = await getWorkspaceMembership(workspaceId, userId);
+
+  if (!target) return;
+
+  if (target.role === "owner") {
+    if (!isSystemAdmin && actorRole !== "owner") {
+      throw new AuthorizationError(
+        "Apenas um proprietário pode remover outro proprietário.",
+      );
+    }
+
+    if ((await countWorkspaceOwners(workspaceId)) <= 1) {
+      throw new ConflictError(
+        "Este é o último proprietário do espaço de trabalho e não pode ser removido.",
+      );
+    }
+  }
+
+  await getDb().transaction(async (tx) => {
+    // Sair do workspace precisa levar junto o acesso derivado dele: os vínculos
+    // de quadro e as atribuições de card sobreviveriam à remoção.
+    const workspaceBoardIds = tx
+      .select({ id: boards.id })
+      .from(boards)
+      .where(eq(boards.workspaceId, workspaceId));
+
+    await tx
+      .delete(boardMembers)
+      .where(
+        and(
+          eq(boardMembers.userId, userId),
+          inArray(boardMembers.boardId, workspaceBoardIds),
+        ),
+      );
+
+    await tx
+      .delete(cardAssignees)
+      .where(
+        and(
+          eq(cardAssignees.userId, userId),
+          inArray(
+            cardAssignees.cardId,
+            tx
+              .select({ id: cards.id })
+              .from(cards)
+              .where(eq(cards.workspaceId, workspaceId)),
+          ),
+        ),
+      );
+
+    await tx
+      .delete(workspaceMembers)
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, userId),
+        ),
+      );
+  });
+
+  // A sessão em curso continuaria válida por até sete dias; encerrar é o que
+  // torna a remoção efetiva de imediato.
+  await revokeAllUserSessions(userId);
 }
 
 export async function listBoardMembersForCurrentUser(boardId: string) {
@@ -1358,6 +2945,105 @@ export async function listWorkspaceMemberOptionsForBoard(boardId: string) {
     .orderBy(asc(users.name));
 }
 
+export async function listAssignableMembersForCurrentUser(boardId: string) {
+  const { board } = await requireBoardAccess(boardId, "edit");
+
+  return getDb()
+    .select({
+      userId: users.id,
+      name: users.name,
+      email: users.email,
+      avatarUrl: users.avatarUrl,
+    })
+    .from(workspaceMembers)
+    .innerJoin(users, eq(users.id, workspaceMembers.userId))
+    .where(eq(workspaceMembers.workspaceId, board.workspaceId))
+    .orderBy(asc(users.name));
+}
+
+export async function isCardAssignee(userId: string, cardId: string) {
+  const [row] = await getDb()
+    .select({ userId: cardAssignees.userId })
+    .from(cardAssignees)
+    .where(
+      and(eq(cardAssignees.cardId, cardId), eq(cardAssignees.userId, userId)),
+    )
+    .limit(1);
+
+  return Boolean(row);
+}
+
+/**
+ * Confirma que o usuário pertence ao workspace do quadro.
+ *
+ * Sem esta checagem, qualquer UUID de usuário do sistema era aceito como
+ * responsável ou membro de quadro — a fronteira entre workspaces ficava aberta
+ * a quem conhecesse um id de fora.
+ */
+async function assertBelongsToWorkspace(workspaceId: string, userId: string) {
+  const membership = await getWorkspaceMembership(workspaceId, userId);
+
+  if (!membership) {
+    throw new ResourceNotFoundError(
+      "Este usuário não pertence a este espaço de trabalho.",
+    );
+  }
+}
+
+export async function assignCardForCurrentUser(cardId: string, userId: string) {
+  const { card, board, session } = await requireCardBoardAccess(cardId, "edit");
+
+  await assertBelongsToWorkspace(board.workspaceId, userId);
+
+  const inserted = await getDb()
+    .insert(cardAssignees)
+    .values({ cardId: card.id, userId, assignedBy: session.userId })
+    .onConflictDoNothing()
+    .returning({ userId: cardAssignees.userId });
+
+  if (inserted.length === 0) return;
+
+  const [assignee] = await getDb()
+    .select({ name: users.name })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  await recordCardEventSafely({
+    workspaceId: board.workspaceId,
+    boardId: board.id,
+    cardId: card.id,
+    actorId: session.userId,
+    type: CARD_EVENT_TYPES.assigned,
+    metadata: { assigneeId: userId, assigneeName: assignee?.name ?? null },
+  });
+}
+
+export async function unassignCardForCurrentUser(
+  cardId: string,
+  userId: string,
+) {
+  const { card, board, session } = await requireCardBoardAccess(cardId, "edit");
+
+  const removed = await getDb()
+    .delete(cardAssignees)
+    .where(
+      and(eq(cardAssignees.cardId, card.id), eq(cardAssignees.userId, userId)),
+    )
+    .returning({ userId: cardAssignees.userId });
+
+  if (removed.length === 0) return;
+
+  await recordCardEventSafely({
+    workspaceId: board.workspaceId,
+    boardId: board.id,
+    cardId: card.id,
+    actorId: session.userId,
+    type: CARD_EVENT_TYPES.unassigned,
+    metadata: { assigneeId: userId },
+  });
+}
+
 const addBoardMemberInputSchema = z.object({
   userId: uuidSchema,
   role: z.enum(["manager", "editor", "viewer"]),
@@ -1369,6 +3055,8 @@ export async function addBoardMemberForCurrentUser(
 ) {
   const parsed = addBoardMemberInputSchema.parse(input);
   const { board } = await requireBoardAccess(boardId, "manage");
+
+  await assertBelongsToWorkspace(board.workspaceId, parsed.userId);
 
   const [membership] = await getDb()
     .select({ userId: boardMembers.userId })
@@ -1390,16 +3078,38 @@ export async function addBoardMemberForCurrentUser(
     .values({ boardId: board.id, userId: parsed.userId, role: parsed.role });
 }
 
+const boardMemberRoleSchema = z.enum(["manager", "editor", "viewer"]);
+
+/**
+ * Um gestor de quadro não pode alterar o próprio papel: seria a mesma
+ * escalada de privilégio do nível de workspace, um degrau abaixo. Quem
+ * administra o workspace continua podendo, porque não depende deste vínculo
+ * para manter o acesso.
+ */
+function assertNotSelfRoleChange(access: BoardAccessResult, userId: string) {
+  const isWorkspaceManager =
+    access.session.user.systemRole === "admin" ||
+    access.workspaceRole === "owner" ||
+    access.workspaceRole === "admin";
+
+  if (access.session.userId === userId && !isWorkspaceManager) {
+    throw new ConflictError("Você não pode alterar o seu próprio papel.");
+  }
+}
+
 export async function updateBoardMemberRoleForCurrentUser(
   boardId: string,
   userId: string,
   role: BoardMemberRole,
 ) {
-  await requireBoardAccess(boardId, "manage");
+  const nextRole = boardMemberRoleSchema.parse(role);
+  const access = await requireBoardAccess(boardId, "manage");
+
+  assertNotSelfRoleChange(access, userId);
 
   await getDb()
     .update(boardMembers)
-    .set({ role })
+    .set({ role: nextRole })
     .where(
       and(eq(boardMembers.boardId, boardId), eq(boardMembers.userId, userId)),
     );
@@ -1409,7 +3119,9 @@ export async function removeBoardMemberForCurrentUser(
   boardId: string,
   userId: string,
 ) {
-  await requireBoardAccess(boardId, "manage");
+  const access = await requireBoardAccess(boardId, "manage");
+
+  assertNotSelfRoleChange(access, userId);
 
   await getDb()
     .delete(boardMembers)
@@ -1426,6 +3138,37 @@ export async function listIntakeFormsForBoard(boardId: string) {
     .from(intakeForms)
     .where(eq(intakeForms.boardId, boardId))
     .orderBy(asc(intakeForms.name));
+}
+
+export async function listIntakeFormsWithStatsForBoard(boardId: string) {
+  await requireBoardAccess(boardId, "manage");
+
+  const [forms, counts] = await Promise.all([
+    getDb()
+      .select()
+      .from(intakeForms)
+      .where(eq(intakeForms.boardId, boardId))
+      .orderBy(asc(intakeForms.name)),
+    getDb()
+      .select({
+        formId: cards.sourceFormId,
+        value: sql<number>`count(*)::int`,
+      })
+      .from(cards)
+      .where(
+        and(eq(cards.boardId, boardId), isNotNull(cards.sourceFormId)),
+      )
+      .groupBy(cards.sourceFormId),
+  ]);
+
+  const submissionCountByForm = new Map(
+    counts.map((row) => [row.formId, row.value]),
+  );
+
+  return forms.map((form) => ({
+    ...form,
+    submissionCount: submissionCountByForm.get(form.id) ?? 0,
+  }));
 }
 
 export async function createIntakeFormForCurrentUser(
@@ -1731,6 +3474,9 @@ export async function sendCardEmailForCurrentUser(input: {
       subjectTemplate: parsed.subject,
       bodyTemplate: parsed.body,
       context: {},
+      // Texto escrito por uma pessoa, não um modelo: sem isto, qualquer
+      // `{{ algo }}` que ela digitasse era apagado da mensagem.
+      skipTemplating: true,
     });
 
     await getDb()

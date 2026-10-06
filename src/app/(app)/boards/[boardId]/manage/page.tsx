@@ -5,7 +5,6 @@ import { getCurrentSession } from "@/lib/auth";
 import {
   AuthorizationError,
   getBoardSnapshot,
-  getWorkspaceSummary,
   listBoardMembersForCurrentUser,
   listCustomFieldsForBoard,
   listFormFieldsForForm,
@@ -15,12 +14,23 @@ import {
   ResourceNotFoundError,
 } from "@/lib/dal";
 
+const MANAGE_TABS = [
+  "formulario",
+  "fases",
+  "pessoas",
+  "email",
+  "configuracoes",
+] as const;
+
 export default async function ManageBoardPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ boardId: string }>;
+  searchParams: Promise<{ tab?: string; phaseId?: string }>;
 }) {
   const { boardId } = await params;
+  const { tab, phaseId } = await searchParams;
 
   let snapshot: Awaited<ReturnType<typeof getBoardSnapshot>>;
   try {
@@ -65,8 +75,6 @@ export default async function ManageBoardPage({
     intakeForms.map((form) => listFormFieldsForForm(form.id)),
   );
 
-  const workspace = await getWorkspaceSummary(snapshot.board.workspaceId);
-
   let workspaceMembers: Awaited<
     ReturnType<typeof listWorkspaceMembersForCurrentUser>
   > | null = null;
@@ -83,13 +91,32 @@ export default async function ManageBoardPage({
   return (
     <ManageView
       boardId={boardId}
-      boardName={snapshot.board.name}
       workspaceId={snapshot.board.workspaceId}
-      workspaceName={workspace.name}
+      boardName={snapshot.board.name}
+      boardColor={snapshot.board.color}
+      boardDescription={snapshot.board.description}
+      boardIcon={snapshot.board.icon}
+      boardVisibility={snapshot.board.visibility}
+      createCardButtonLabel={snapshot.board.createCardButtonLabel}
+      expirationMinutes={snapshot.board.expirationMinutes}
+      kanbanVisibleFieldIds={snapshot.board.kanbanVisibleFieldIds}
+      onlyAssigneeCanEdit={snapshot.board.onlyAssigneeCanEdit}
+      onlyManagerCanDeleteCards={snapshot.board.onlyManagerCanDeleteCards}
+      mailFromAddress={process.env.MAIL_FROM ?? "Fluxo Interno <noreply@localhost>"}
       currentUserId={session.user.id}
+      initialTab={
+        MANAGE_TABS.includes(tab as (typeof MANAGE_TABS)[number])
+          ? (tab as (typeof MANAGE_TABS)[number])
+          : phaseId
+            ? "fases"
+            : "formulario"
+      }
+      initialPhaseId={phaseId ?? null}
       phases={snapshot.phases.map((phase) => ({
         id: phase.id,
         name: phase.name,
+        color: phase.color,
+        cardLimit: phase.cardLimit,
       }))}
       boardMembers={boardMembers.map((member) => ({
         userId: member.userId,
@@ -117,6 +144,7 @@ export default async function ManageBoardPage({
         label: field.label,
         type: field.type,
         isRequired: field.isRequired,
+        phaseId: field.phaseId,
         options: Array.isArray((field.config as { options?: unknown })?.options)
           ? (field.config as { options: Array<{ label: string; value: string }> })
               .options

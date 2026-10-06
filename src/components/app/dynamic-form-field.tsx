@@ -2,6 +2,7 @@
 
 import { useId } from "react"
 
+import { getIconComponent } from "@/components/app/phase-icons"
 import type {
   FormFieldDTO,
   FormInitialValue,
@@ -154,6 +155,82 @@ export function DynamicFormField({
               <span className="sr-only">{option.label}</span>
             </label>
           ))}
+        </div>
+      )}
+
+      {field.type === "file" && (
+        <Input
+          id={fieldId}
+          name={field.name}
+          type="file"
+          multiple={field.multiple}
+          // Espelha a allowlist do servidor (src/lib/attachments.ts). Deixar
+          // `image/*` aqui faria o seletor oferecer SVG, que é recusado no
+          // envio — o usuário escolheria o arquivo só para receber um erro.
+          accept={
+            field.accept ??
+            "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,application/pdf"
+          }
+          required={field.required}
+          disabled={field.disabled}
+          aria-describedby={descriptionId}
+        />
+      )}
+
+      {field.type === "radio" && (
+        <div
+          role="radiogroup"
+          aria-describedby={descriptionId}
+          className="space-y-2"
+        >
+          {field.options.map((option) => (
+            <label
+              key={option.value}
+              className="flex items-center gap-2.5 text-sm"
+            >
+              <input
+                type="radio"
+                name={field.name}
+                value={option.value}
+                defaultChecked={stringValue === option.value}
+                required={field.required}
+                disabled={field.disabled}
+                className="size-4 accent-primary"
+              />
+              {option.label}
+            </label>
+          ))}
+        </div>
+      )}
+
+      {field.type === "icon" && (
+        <div
+          role="radiogroup"
+          aria-describedby={descriptionId}
+          className="flex flex-wrap gap-2"
+        >
+          {field.options.map((option) => {
+            const Icon = getIconComponent(option.value)
+            return (
+              <label key={option.value} className="cursor-pointer">
+                <input
+                  type="radio"
+                  name={field.name}
+                  value={option.value}
+                  defaultChecked={stringValue === option.value}
+                  required={field.required}
+                  disabled={field.disabled}
+                  className="peer sr-only"
+                />
+                <span
+                  title={option.label}
+                  className="grid size-9 place-items-center rounded-lg border text-muted-foreground ring-1 ring-transparent transition-colors peer-checked:border-primary/40 peer-checked:bg-primary/10 peer-checked:text-primary peer-checked:ring-primary/30 peer-focus-visible:ring-2"
+                >
+                  <Icon className="size-4" />
+                </span>
+              </label>
+            )
+          })}
         </div>
       )}
 

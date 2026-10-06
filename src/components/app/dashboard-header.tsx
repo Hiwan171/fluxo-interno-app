@@ -2,15 +2,15 @@
 
 import Link from "next/link"
 import {
-  BellIcon,
   ChevronDownIcon,
-  HelpCircleIcon,
   LogOutIcon,
   SearchIcon,
+  ShieldIcon,
   UserRoundIcon,
 } from "lucide-react"
 
 import { AppLogo } from "@/components/app/app-logo"
+import { ThemeToggle } from "@/components/app/theme-toggle"
 import type { AppUserDTO } from "@/components/app/types"
 import {
   Avatar,
@@ -40,6 +40,8 @@ function getInitials(name: string) {
 
 export interface DashboardHeaderProps {
   workspaceName: string
+  workspaces?: Array<{ id: string; name: string; slug: string }>
+  isSystemAdmin?: boolean
   user: AppUserDTO
   signOutAction?: () => void | Promise<void>
   searchValue: string
@@ -48,6 +50,8 @@ export interface DashboardHeaderProps {
 
 export function DashboardHeader({
   workspaceName,
+  workspaces = [],
+  isSystemAdmin = false,
   user,
   signOutAction,
   searchValue,
@@ -60,15 +64,6 @@ export function DashboardHeader({
       <nav aria-label="Navegação principal" className="ml-2 flex items-center gap-1">
         <Button asChild type="button" variant="default" size="sm" className="rounded-full">
           <Link href="/">Início</Link>
-        </Button>
-        <Button type="button" variant="ghost" size="sm" disabled>
-          Portal
-        </Button>
-        <Button type="button" variant="ghost" size="sm" disabled>
-          Tarefas e Solicitações
-        </Button>
-        <Button type="button" variant="ghost" size="sm" disabled>
-          Interfaces
         </Button>
       </nav>
 
@@ -84,15 +79,41 @@ export function DashboardHeader({
         />
       </div>
 
-      <Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Notificações">
-        <BellIcon />
-      </Button>
-      <Button type="button" variant="ghost" size="icon-sm" disabled aria-label="Ajuda">
-        <HelpCircleIcon />
-      </Button>
-      <Badge variant="secondary" className="hidden font-semibold sm:inline-flex">
-        {workspaceName}
-      </Badge>
+      <ThemeToggle />
+
+      {workspaces.length > 1 ? (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="hidden gap-1.5 font-semibold sm:inline-flex"
+              aria-label="Trocar de espaço de trabalho"
+            >
+              {workspaceName}
+              <ChevronDownIcon className="size-3.5 text-muted-foreground" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56">
+            <DropdownMenuLabel>Espaços de trabalho</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            {workspaces.map((workspace) => (
+              <DropdownMenuItem key={workspace.id} asChild>
+                {/* O espaço vai na URL para que a escolha sobreviva ao
+                    recarregamento e o link possa ser compartilhado. */}
+                <Link href={`/?workspace=${encodeURIComponent(workspace.slug)}`}>
+                  {workspace.name}
+                </Link>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : (
+        <Badge variant="secondary" className="hidden font-semibold sm:inline-flex">
+          {workspaceName}
+        </Badge>
+      )}
 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -123,10 +144,20 @@ export function DashboardHeader({
             </span>
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem disabled>
-            <UserRoundIcon />
-            Minha conta
+          <DropdownMenuItem asChild>
+            <Link href="/conta">
+              <UserRoundIcon />
+              Minha conta
+            </Link>
           </DropdownMenuItem>
+          {isSystemAdmin && (
+            <DropdownMenuItem asChild>
+              <Link href="/admin">
+                <ShieldIcon />
+                Administração
+              </Link>
+            </DropdownMenuItem>
+          )}
           {signOutAction && (
             <form action={signOutAction}>
               <DropdownMenuItem asChild>

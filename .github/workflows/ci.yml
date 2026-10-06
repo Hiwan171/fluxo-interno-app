@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Uma execução por referência: um push novo cancela a análise já em andamento
+# em vez de deixar as duas competindo pelos executores.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Testes
+        run: npm test
+
+      - name: Build
+        # O build precisa da variável, mas não conecta ao banco: o schema é lido
+        # do código e todas as páginas são renderizadas sob demanda.
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+        run: npm run build
+
+  migrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fluxo
+          POSTGRES_PASSWORD: fluxo
+          POSTGRES_DB: fluxo_ci
+        options: >-
+          --health-cmd "pg_isready -U fluxo -d fluxo_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Aplicar migrations num banco limpo
+        # Prova que a sequência de migrations reconstrói o schema do zero — que
+        # é exatamente o que acontece num deploy novo.
+        env:
+          DATABASE_URL: postgresql://fluxo:fluxo@localhost:5432/fluxo_ci
+        run: npm run db:migrate
+
+      - name: Conferir que o schema e as migrations não divergiram
+        # `generate` só cria arquivo se houver diferença entre o schema em
+        # TypeScript e o que as migrations produzem. Qualquer arquivo novo aqui
+        # significa que alguém editou o schema sem gerar a migration.
+        env:
+          DATABASE_URL: postgresql://fluxo:fluxo@localhost:5432/fluxo_ci
+        run: |
+          npm run db:generate
+          if [ -n "$(git status --porcelain drizzle)" ]; then
+            echo "O schema mudou sem migration correspondente:"
+            git status --porcelain drizzle
+            exit 1
+          fi

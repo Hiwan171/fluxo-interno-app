@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, type FormEvent } from "react"
+import { useState, type FormEvent } from "react"
 import { CircleAlertIcon, LoaderCircleIcon } from "lucide-react"
 
 import { DynamicFormField } from "@/components/app/dynamic-form-field"
@@ -50,10 +50,15 @@ export function CardFormDialog({
 }: CardFormDialogProps) {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
+  const [wasOpen, setWasOpen] = useState(open)
 
-  useEffect(() => {
+  // Ajuste de estado durante o render, em vez de um efeito: reabrir o diálogo
+  // não deve mostrar o erro da tentativa anterior, e fazer isso num efeito
+  // renderizaria o erro antigo por um quadro antes de limpá-lo.
+  if (open !== wasOpen) {
+    setWasOpen(open)
     if (open) setLocalError(null)
-  }, [open])
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()

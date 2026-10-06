@@ -4,14 +4,34 @@ import { and, asc, desc, eq, sql } from "drizzle-orm";
 
 import { getDb } from "@/db";
 import {
+  attachments,
   boards,
   cardFieldValues,
   cards,
+  customFields,
   formFields,
   intakeForms,
   phases,
 } from "@/db/schema";
+import type { UploadedFileMeta } from "@/lib/attachments";
 import { ConflictError, ResourceNotFoundError } from "@/lib/dal";
+import { CARD_EVENT_TYPES, recordCardEvent } from "@/lib/events";
+import { normalizeFieldValues } from "@/lib/field-values";
+
+type PendingAttachmentValue = {
+  kind: "attachment";
+  files: UploadedFileMeta[];
+};
+
+function isPendingAttachmentValue(
+  value: unknown,
+): value is PendingAttachmentValue {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { kind?: unknown }).kind === "attachment"
+  );
+}
 
 /**
  * Functions in this file are intentionally reachable without an authenticated
@@ -19,6 +39,13 @@ import { ConflictError, ResourceNotFoundError } from "@/lib/dal";
  * `requireSession`/`requireBoardAccess` here; do all access checks by
  * verifying the intake form itself (must exist and be published).
  */
+
+function trimmedText(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLength) : null;
+}
 
 export async function getPublicIntakeForm(publicKey: string) {
   const [form] = await getDb()
@@ -88,14 +115,16 @@ export async function submitPublicIntakeForm(
       throw new ConflictError(`O campo "${field.label}" é obrigatório.`);
     }
 
+    // Os limites espelham as colunas do banco. Sem eles, um envio anônimo
+    // podia estourar o tamanho da coluna e derrubar a inserção.
     if (field.targetField === "title") {
-      title = typeof raw === "string" ? raw.trim() : null;
+      title = trimmedText(raw, 240);
     } else if (field.targetField === "description") {
-      description = typeof raw === "string" ? raw.trim() : null;
+      description = trimmedText(raw, 20_000);
     } else if (field.targetField === "requester_name") {
-      requesterName = typeof raw === "string" ? raw.trim() : null;
+      requesterName = trimmedText(raw, 160);
     } else if (field.targetField === "requester_email") {
-      requesterEmail = typeof raw === "string" ? raw.trim() : null;
+      requesterEmail = trimmedText(raw, 320);
     } else if (field.customFieldId) {
       fieldValues[field.customFieldId] = raw;
     }
@@ -104,6 +133,27 @@ export async function submitPublicIntakeForm(
   if (form.requireRequesterEmail && !requesterEmail) {
     throw new ConflictError("Informe um e-mail para continuar.");
   }
+
+  // Mesma validação do caminho autenticado. Este é o ponto de entrada anônimo:
+  // antes, qualquer valor entrava no jsonb sem conferir tipo, tamanho ou se a
+  // opção escolhida existia.
+  const definitions = await getDb()
+    .select({
+      id: customFields.id,
+      label: customFields.label,
+      type: customFields.type,
+      config: customFields.config,
+      isRequired: customFields.isRequired,
+    })
+    .from(customFields)
+    .where(
+      and(
+        eq(customFields.boardId, form.boardId),
+        eq(customFields.isArchived, false),
+      ),
+    );
+
+  const normalizedValues = normalizeFieldValues(definitions, fieldValues);
 
   let targetPhaseId = form.targetPhaseId;
   if (!targetPhaseId) {
@@ -124,10 +174,17 @@ export async function submitPublicIntakeForm(
   }
 
   return getDb().transaction(async (tx) => {
-    const [numberRow] = await tx
-      .select({ value: sql<number>`coalesce(max(${cards.number}), 0) + 1` })
-      .from(cards)
-      .where(eq(cards.boardId, form.boardId));
+    // Mesmo contador atômico do caminho autenticado: o formulário público é
+    // justamente o mais exposto a envios simultâneos.
+    const [sequenceRow] = await tx
+      .update(boards)
+      .set({ cardSequence: sql`${boards.cardSequence} + 1` })
+      .where(eq(boards.id, form.boardId))
+      .returning({ value: boards.cardSequence });
+
+    if (!sequenceRow) {
+      throw new ResourceNotFoundError("Quadro não encontrado.");
+    }
 
     const [countRow] = await tx
       .select({ value: sql<number>`count(*)::int` })
@@ -140,7 +197,7 @@ export async function submitPublicIntakeForm(
         workspaceId: form.workspaceId,
         boardId: form.boardId,
         phaseId: targetPhaseId,
-        number: numberRow.value,
+        number: sequenceRow.value,
         title: title || form.name,
         description,
         position: countRow.value,
@@ -151,11 +208,52 @@ export async function submitPublicIntakeForm(
       })
       .returning();
 
-    for (const [customFieldId, value] of Object.entries(fieldValues)) {
+    for (const [customFieldId, rawValue] of Object.entries(normalizedValues)) {
+      let value = rawValue;
+
+      if (isPendingAttachmentValue(rawValue)) {
+        const files = rawValue.files;
+        value = { attachmentIds: [] as string[] };
+        if (files.length > 0) {
+          const insertedAttachments = await tx
+            .insert(attachments)
+            .values(
+              files.map((file) => ({
+                cardId: created.id,
+                customFieldId,
+                fileName: file.fileName,
+                mimeType: file.mimeType,
+                sizeBytes: file.sizeBytes,
+                storageKey: file.storageKey,
+              })),
+            )
+            .returning({ id: attachments.id });
+          value = { attachmentIds: insertedAttachments.map((row) => row.id) };
+        }
+      }
+
       await tx
         .insert(cardFieldValues)
         .values({ cardId: created.id, customFieldId, value });
     }
+
+    // Sem ator: o card nasceu de um envio anônimo. O histórico registra a
+    // origem para que a triagem saiba de onde veio.
+    await recordCardEvent(
+      {
+        workspaceId: form.workspaceId,
+        boardId: form.boardId,
+        cardId: created.id,
+        actorId: null,
+        type: CARD_EVENT_TYPES.created,
+        metadata: {
+          source: "form",
+          formName: form.name,
+          requesterEmail: requesterEmail ?? null,
+        },
+      },
+      tx,
+    );
 
     return { card: created, successMessage: form.successMessage };
   });

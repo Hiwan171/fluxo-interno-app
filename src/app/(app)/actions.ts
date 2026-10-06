@@ -37,6 +37,7 @@ export async function createBoardAction(
   }
 
   const colorValue = String(formData.get("color") ?? "").trim();
+  const iconValue = String(formData.get("icon") ?? "").trim();
 
   try {
     const board = await createBoardForCurrentUser({
@@ -44,6 +45,7 @@ export async function createBoardAction(
       name,
       slug: slugify(name),
       color: colorValue || "#2563eb",
+      icon: iconValue || null,
     });
 
     revalidatePath("/");

@@ -19,7 +19,9 @@
 		Permissions-Policy "camera=(), geolocation=(), microphone=()"
 	}
 
-	reverse_proxy 127.0.0.1:{$APP_PORT:3000} {
+	# `app` e o nome do servico na rede do compose; 127.0.0.1 apontaria para o
+	# proprio container do Caddy.
+	reverse_proxy app:3000 {
 		# Mantém streaming do App Router sem buffering no proxy.
 		flush_interval -1
 	}

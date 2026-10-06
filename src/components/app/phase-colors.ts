@@ -7,10 +7,11 @@ export interface PhaseColorOption {
 }
 
 export const PHASE_COLOR_PALETTE: PhaseColorOption[] = [
-  { label: "Verde-azulado", value: "#0d9488", accent: "teal" },
-  { label: "Azul", value: "#2563eb", accent: "blue" },
-  { label: "Âmbar", value: "#d97706", accent: "amber" },
-  { label: "Rosa", value: "#e11d48", accent: "rose" },
+  { label: "Azul-celeste", value: "#0ea5e9", accent: "sky" },
+  { label: "Vermelho", value: "#dc2626", accent: "red" },
+  { label: "Rosa", value: "#ec4899", accent: "pink" },
+  { label: "Roxo", value: "#9333ea", accent: "purple" },
+  { label: "Verde-limão", value: "#65a30d", accent: "lime" },
   { label: "Neutro", value: "#71717a", accent: "neutral" },
 ]
 

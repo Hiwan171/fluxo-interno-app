@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import {
   closestCorners,
   DndContext,
@@ -9,7 +9,6 @@ import {
   PointerSensor,
   useSensor,
   useSensors,
-  type DragCancelEvent,
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core"
@@ -20,7 +19,7 @@ import { EmptyState } from "@/components/app/empty-state"
 import { KanbanCard } from "@/components/app/kanban-card"
 import { KanbanColumn } from "@/components/app/kanban-column"
 import type {
-  KanbanCardDTO,
+  CustomFieldDTO,
   KanbanColumnDTO,
   KanbanMoveInput,
 } from "@/components/app/types"
@@ -30,9 +29,19 @@ import { cn } from "@/lib/utils"
 
 export interface KanbanBoardProps {
   columns: KanbanColumnDTO[]
-  onMoveCard?: (input: KanbanMoveInput) => void | Promise<void>
+  /**
+   * Devolve `{ error }` quando o servidor recusa o movimento — limite da fase
+   * atingido, permissão insuficiente. Lançar não serviria: o Next apaga a
+   * mensagem de exceções vindas de server actions em produção.
+   */
+  onMoveCard?: (
+    input: KanbanMoveInput
+  ) => void | Promise<void | { error?: string; success?: boolean }>
   onCardOpen?: (cardId: string) => void
   onCreateCard?: (columnId: string) => void
+  createCardButtonLabel?: string | null
+  customFields?: CustomFieldDTO[]
+  visibleCustomFieldIds?: string[]
   onEditCard?: (cardId: string) => void
   onDuplicateCard?: (cardId: string) => void
   onArchiveCard?: (cardId: string) => void
@@ -105,6 +114,9 @@ export function KanbanBoard({
   onMoveCard,
   onCardOpen,
   onCreateCard,
+  createCardButtonLabel,
+  customFields,
+  visibleCustomFieldIds,
   onEditCard,
   onDuplicateCard,
   onArchiveCard,
@@ -129,9 +141,17 @@ export function KanbanBoard({
     })
   )
 
-  useEffect(() => {
-    if (!isMoving) setLocalColumns(columns)
-  }, [columns, isMoving])
+  const [syncedColumns, setSyncedColumns] = useState(columns)
+
+  // O estado local existe para o arrastar-e-soltar responder na hora. Quando o
+  // servidor manda uma versão nova, ela precisa substituir a otimista — mas não
+  // no meio de um movimento em curso, senão o card volta para a origem antes de
+  // a gravação terminar. Ajustar durante o render evita o quadro intermediário
+  // em que a tela mostraria dados já superados.
+  if (columns !== syncedColumns && !isMoving) {
+    setSyncedColumns(columns)
+    setLocalColumns(columns)
+  }
 
   const activeCard = useMemo(
     () =>
@@ -145,7 +165,7 @@ export function KanbanBoard({
     setActiveCardId(String(event.active.id))
   }, [])
 
-  const handleDragCancel = useCallback((_event: DragCancelEvent) => {
+  const handleDragCancel = useCallback(() => {
     setActiveCardId(null)
   }, [])
 
@@ -202,7 +222,12 @@ export function KanbanBoard({
 
       setIsMoving(true)
       try {
-        await onMoveCard(input)
+        const result = await onMoveCard(input)
+
+        if (result?.error) {
+          setLocalColumns(previousColumns)
+          setMoveError(result.error)
+        }
       } catch {
         setLocalColumns(previousColumns)
         setMoveError(
@@ -277,6 +302,9 @@ export function KanbanBoard({
               column={column}
               onCardOpen={onCardOpen}
               onCreateCard={onCreateCard}
+              createCardButtonLabel={createCardButtonLabel}
+              customFields={customFields}
+              visibleCustomFieldIds={visibleCustomFieldIds}
               onEditCard={onEditCard}
               onDuplicateCard={onDuplicateCard}
               onArchiveCard={onArchiveCard}
@@ -306,7 +334,13 @@ export function KanbanBoard({
         </div>
         <DragOverlay>
           {activeCard ? (
-            <KanbanCard card={activeCard} isOverlay className="w-80" />
+            <KanbanCard
+              card={activeCard}
+              isOverlay
+              className="w-80"
+              customFields={customFields}
+              visibleCustomFieldIds={visibleCustomFieldIds}
+            />
           ) : null}
         </DragOverlay>
       </DndContext>

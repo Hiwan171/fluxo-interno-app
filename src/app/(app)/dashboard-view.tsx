@@ -4,12 +4,7 @@ import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
-  BarChart3Icon,
-  BriefcaseIcon,
   ChevronDownIcon,
-  Columns3Icon,
-  HelpCircleIcon,
-  LayoutTemplateIcon,
   LockIcon,
   PlusIcon,
 } from "lucide-react";
@@ -18,13 +13,13 @@ import { createBoardAction } from "@/app/(app)/actions";
 import { CardFormDialog } from "@/components/app/card-form-dialog";
 import { DashboardHeader } from "@/components/app/dashboard-header";
 import { PHASE_COLOR_PALETTE } from "@/components/app/phase-colors";
+import { getIconComponent, ICON_PALETTE } from "@/components/app/phase-icons";
 import type {
   AppUserDTO,
   FormFieldDTO,
   FormSubmitResult,
 } from "@/components/app/types";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
 
 const CREATE_BOARD_FIELDS: FormFieldDTO[] = [
   {
@@ -43,13 +38,15 @@ const CREATE_BOARD_FIELDS: FormFieldDTO[] = [
       value: option.value,
     })),
   },
-];
-
-const QUICK_ACTIONS = [
-  { label: "Meu trabalho", icon: BriefcaseIcon },
-  { label: "Templates", icon: LayoutTemplateIcon },
-  { label: "Ajuda", icon: HelpCircleIcon },
-  { label: "Estatísticas de uso", icon: BarChart3Icon },
+  {
+    type: "icon",
+    name: "icon",
+    label: "Ícone",
+    options: ICON_PALETTE.map((option) => ({
+      label: option.label,
+      value: option.value,
+    })),
+  },
 ];
 
 const VISIBLE_BOARD_LIMIT = 7;
@@ -58,6 +55,7 @@ export interface DashboardBoard {
   id: string;
   name: string;
   color: string;
+  icon?: string | null;
   visibility: "workspace" | "private";
   cardCount: number;
 }
@@ -65,6 +63,8 @@ export interface DashboardBoard {
 export interface DashboardViewProps {
   workspaceId: string;
   workspaceName: string;
+  workspaces?: Array<{ id: string; name: string; slug: string }>;
+  isSystemAdmin?: boolean;
   user: AppUserDTO;
   signOutAction: () => void | Promise<void>;
   boards: DashboardBoard[];
@@ -74,6 +74,8 @@ export interface DashboardViewProps {
 export function DashboardView({
   workspaceId,
   workspaceName,
+  workspaces = [],
+  isSystemAdmin = false,
   user,
   signOutAction,
   boards,
@@ -113,6 +115,8 @@ export function DashboardView({
     <div className="flex h-full min-h-0 flex-col">
       <DashboardHeader
         workspaceName={workspaceName}
+        workspaces={workspaces}
+        isSystemAdmin={isSystemAdmin}
         user={user}
         signOutAction={signOutAction}
         searchValue={search}
@@ -121,26 +125,15 @@ export function DashboardView({
 
       <div className="min-h-0 flex-1 overflow-auto bg-[var(--workspace)]">
         <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <Avatar size="lg">
-                <AvatarFallback className="bg-primary/10 font-semibold text-primary">
-                  {firstName.slice(0, 2).toUpperCase()}
-                </AvatarFallback>
-              </Avatar>
-              <h1 className="font-heading text-lg font-semibold tracking-[-0.01em] sm:text-xl">
-                {firstName}, vamos turbinar o próximo processo
-              </h1>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              {QUICK_ACTIONS.map(({ label, icon: Icon }) => (
-                <Button key={label} type="button" variant="ghost" size="sm" disabled>
-                  <Icon />
-                  {label}
-                </Button>
-              ))}
-            </div>
+          <div className="flex items-center gap-3">
+            <Avatar size="lg">
+              <AvatarFallback className="bg-primary/10 font-semibold text-primary">
+                {firstName.slice(0, 2).toUpperCase()}
+              </AvatarFallback>
+            </Avatar>
+            <h1 className="font-heading text-lg font-semibold tracking-[-0.01em] sm:text-xl">
+              {firstName}, vamos turbinar o próximo processo
+            </h1>
           </div>
 
           <div className="mt-8 flex items-center gap-4 border-b">
@@ -150,17 +143,6 @@ export function DashboardView({
             <span className="cursor-not-allowed border-b-2 border-transparent pb-2.5 text-sm font-medium text-muted-foreground/50">
               Bases de dados
             </span>
-          </div>
-
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <Button type="button" variant="outline" size="sm" disabled>
-              Mostrar: Todos os quadros
-              <ChevronDownIcon />
-            </Button>
-            <Button type="button" variant="outline" size="sm" disabled>
-              Tags: Todas
-              <ChevronDownIcon />
-            </Button>
           </div>
 
           <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
@@ -175,7 +157,9 @@ export function DashboardView({
               </button>
             )}
 
-            {visibleBoards.map((board) => (
+            {visibleBoards.map((board) => {
+              const BoardIcon = getIconComponent(board.icon);
+              return (
               <Link
                 key={board.id}
                 href={`/boards/${board.id}`}
@@ -186,7 +170,7 @@ export function DashboardView({
                   className="grid size-9 shrink-0 place-items-center rounded-lg text-white"
                   style={{ backgroundColor: board.color }}
                 >
-                  <Columns3Icon className="size-4.5" />
+                  <BoardIcon className="size-4.5" />
                 </span>
                 <div className="min-w-0">
                   <p className="line-clamp-2 text-sm font-semibold leading-snug">
@@ -200,7 +184,8 @@ export function DashboardView({
                   </p>
                 </div>
               </Link>
-            ))}
+              );
+            })}
           </div>
 
           {!showAll && filteredBoards.length > VISIBLE_BOARD_LIMIT + 1 && (

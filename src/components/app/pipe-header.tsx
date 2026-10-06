@@ -1,24 +1,27 @@
 "use client"
 
+import { createElement } from "react"
 import Link from "next/link"
 import {
   ArrowLeftIcon,
-  BellIcon,
   ChevronDownIcon,
   Columns3Icon,
-  HelpCircleIcon,
+  GlobeIcon,
   InfoIcon,
-  LinkIcon,
+  LayoutTemplateIcon,
   LogOutIcon,
-  PlugIcon,
+  MailIcon,
   SearchIcon,
   Settings2Icon,
   SlidersHorizontalIcon,
   UserRoundIcon,
+  UsersIcon,
   ZapIcon,
 } from "lucide-react"
 
 import { AppLogo } from "@/components/app/app-logo"
+import { getIconComponent } from "@/components/app/phase-icons"
+import { ThemeToggle } from "@/components/app/theme-toggle"
 import type { AppUserDTO } from "@/components/app/types"
 import {
   Avatar,
@@ -36,7 +39,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
-import { cn } from "@/lib/utils"
 
 function getInitials(name: string) {
   return name
@@ -47,38 +49,39 @@ function getInitials(name: string) {
     .join("")
 }
 
+export type PipeTabKey = "kanban" | "relatorios" | "formulario" | "emails"
+
 export interface PipeHeaderProps {
   boardId: string
   boardName: string
+  boardIcon?: string | null
   workspaceName: string
   user: AppUserDTO
   dashboardHref: string
   signOutAction?: () => void | Promise<void>
   searchValue: string
   onSearchChange: (value: string) => void
+  activeTab?: PipeTabKey
 }
 
 export function PipeHeader({
   boardId,
   boardName,
+  boardIcon,
   workspaceName,
   user,
   dashboardHref,
   signOutAction,
   searchValue,
   onSearchChange,
+  activeTab = "kanban",
 }: PipeHeaderProps) {
   const manageHref = `/boards/${boardId}/manage`
-  const pipeTabs = [
-    { label: "Mapa", href: undefined },
-    { label: "Fluxo", href: undefined },
-    { label: "Kanban", href: undefined, isActive: true },
-    { label: "Lista", href: undefined },
-    { label: "Relatórios", href: undefined },
-    { label: "Formulário", href: `${manageHref}?tab=forms` },
-    { label: "Emails", href: undefined },
-    { label: "Painéis", href: undefined },
-    { label: "Learning Center", href: undefined },
+  const pipeTabs: Array<{ key: PipeTabKey; label: string; href: string }> = [
+    { key: "kanban", label: "Kanban", href: `/boards/${boardId}` },
+    { key: "relatorios", label: "Relatórios", href: `/boards/${boardId}/reports` },
+    { key: "formulario", label: "Formulário", href: `/boards/${boardId}/form` },
+    { key: "emails", label: "Emails", href: `/boards/${boardId}/emails` },
   ]
   return (
     <header className="flex shrink-0 flex-col border-b bg-background">
@@ -87,7 +90,12 @@ export function PipeHeader({
         <div className="h-6 w-px bg-border" />
         <div className="flex min-w-0 items-center gap-2">
           <span className="grid size-7 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
-            <Columns3Icon className="size-4" />
+            {/* `createElement` evita ligar um componente a uma variável do
+                corpo do render — o ícone é escolhido por dado, não por tipo. */}
+            {createElement(getIconComponent(boardIcon), {
+              className: "size-4",
+              "aria-hidden": true,
+            })}
           </span>
           <h1 className="truncate font-heading text-sm font-semibold sm:text-base">
             {boardName}
@@ -97,24 +105,8 @@ export function PipeHeader({
 
         <div className="flex-1" />
 
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          disabled
-          aria-label="Notificações"
-        >
-          <BellIcon />
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          disabled
-          aria-label="Ajuda"
-        >
-          <HelpCircleIcon />
-        </Button>
+        <ThemeToggle />
+
         <Badge variant="secondary" className="hidden font-semibold sm:inline-flex">
           {workspaceName}
         </Badge>
@@ -148,9 +140,11 @@ export function PipeHeader({
               </span>
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
-            <DropdownMenuItem disabled>
-              <UserRoundIcon />
-              Minha conta
+            <DropdownMenuItem asChild>
+              <Link href="/conta">
+                <UserRoundIcon />
+                Minha conta
+              </Link>
             </DropdownMenuItem>
             {signOutAction && (
               <form action={signOutAction}>
@@ -167,46 +161,90 @@ export function PipeHeader({
       </div>
 
       <div className="flex h-11 items-center gap-1.5 border-t bg-muted/30 px-4 sm:px-6">
-        <Button asChild type="button" variant="ghost" size="sm">
+        <Button
+          asChild
+          type="button"
+          variant="secondary"
+          size="sm"
+          className="rounded-full"
+        >
           <Link href={dashboardHref}>
             <ArrowLeftIcon />
             Pipe
           </Link>
         </Button>
         <div className="mx-1 h-5 w-px bg-border" />
-        <Button type="button" variant="ghost" size="sm" disabled>
-          <ZapIcon />
-          Automações
-        </Button>
-        <Button type="button" variant="ghost" size="sm" disabled>
-          <PlugIcon />
-          Integrações
-        </Button>
-        <Button type="button" variant="ghost" size="sm" disabled>
-          <LinkIcon />
-          Conexões
-          <ChevronDownIcon />
+        <Button asChild type="button" variant="ghost" size="sm">
+          <Link href={`/boards/${boardId}/emails/automations`}>
+            <ZapIcon />
+            Automações
+          </Link>
         </Button>
 
         <div className="flex-1" />
 
         <Button asChild type="button" variant="ghost" size="sm">
-          <Link href={`${manageHref}?tab=forms`}>Compartilhar formulário</Link>
-        </Button>
-        <Button asChild type="button" variant="ghost" size="sm">
-          <Link href={manageHref}>
-            <Settings2Icon />
-            Gerenciar
+          <Link href={`/boards/${boardId}/form`}>
+            <GlobeIcon />
+            Compartilhar formulário
           </Link>
         </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button type="button" variant="ghost" size="sm">
+              <Settings2Icon />
+              Gerenciar
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56">
+            <DropdownMenuItem asChild>
+              <Link href={`${manageHref}?tab=formulario`}>
+                <LayoutTemplateIcon />
+                Formulário inicial
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href={`${manageHref}?tab=fases`}>
+                <Columns3Icon />
+                Fases
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href={`${manageHref}?tab=pessoas`}>
+                <UsersIcon />
+                Pessoas
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href={`${manageHref}?tab=email`}>
+                <MailIcon />
+                Email
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href={`${manageHref}?tab=configuracoes`}>
+                <SlidersHorizontalIcon />
+                Configurações do pipe
+              </Link>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
       <div className="flex h-11 items-center gap-1 overflow-x-auto border-t px-4 sm:px-6">
         <nav aria-label="Visualizações do fluxo" className="flex items-center gap-1">
           {pipeTabs.map((tab) =>
-            tab.href ? (
+            tab.key === activeTab ? (
+              <span
+                key={tab.key}
+                aria-current="page"
+                className="flex h-11 shrink-0 cursor-default items-center border-b-2 border-foreground px-2.5 text-sm font-semibold text-foreground"
+              >
+                {tab.label}
+              </span>
+            ) : (
               <Button
-                key={tab.label}
+                key={tab.key}
                 asChild
                 type="button"
                 variant="ghost"
@@ -214,19 +252,6 @@ export function PipeHeader({
               >
                 <Link href={tab.href}>{tab.label}</Link>
               </Button>
-            ) : (
-              <span
-                key={tab.label}
-                aria-current={tab.isActive ? "page" : undefined}
-                aria-disabled={!tab.isActive}
-                className={cn(
-                  "flex h-11 shrink-0 cursor-not-allowed items-center border-b-2 border-transparent px-2.5 text-sm font-medium text-muted-foreground/50",
-                  tab.isActive &&
-                    "cursor-default border-primary font-semibold text-primary"
-                )}
-              >
-                {tab.label}
-              </span>
             )
           )}
         </nav>
@@ -242,15 +267,6 @@ export function PipeHeader({
             className="pl-8"
           />
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          disabled
-          aria-label="Filtros"
-        >
-          <SlidersHorizontalIcon />
-        </Button>
       </div>
     </header>
   )

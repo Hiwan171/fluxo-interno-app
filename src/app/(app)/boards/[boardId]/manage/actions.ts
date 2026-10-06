@@ -7,16 +7,19 @@ import {
   addBoardMemberForCurrentUser,
   addWorkspaceMemberForCurrentUser,
   archiveCustomFieldForCurrentUser,
+  AuthorizationError,
   ConflictError,
   createCustomFieldForCurrentUser,
   createFormFieldForCurrentUser,
   createIntakeFormForCurrentUser,
   deleteFormFieldForCurrentUser,
   deleteIntakeFormForCurrentUser,
+  issuePasswordResetForMemberForCurrentUser,
   listCustomFieldsForBoard,
   moveFormFieldForCurrentUser,
   removeBoardMemberForCurrentUser,
   removeWorkspaceMemberForCurrentUser,
+  updateBoardForCurrentUser,
   updateBoardMemberRoleForCurrentUser,
   updateCustomFieldForCurrentUser,
   updateFormFieldForCurrentUser,
@@ -44,9 +47,14 @@ const FIELD_TYPE_OPTIONS = [
   "long_text",
   "number",
   "date",
+  "datetime",
   "checkbox",
   "select",
+  "radio",
   "email",
+  "phone",
+  "currency",
+  "attachment",
 ] as const;
 type BasicFieldType = (typeof FIELD_TYPE_OPTIONS)[number];
 
@@ -74,6 +82,77 @@ function pickEnum<T extends string>(
 ): T {
   const raw = String(value ?? "");
   return (allowed as readonly string[]).includes(raw) ? (raw as T) : fallback;
+}
+
+const EXPIRATION_UNIT_MINUTES: Record<string, number> = {
+  minutes: 1,
+  hours: 60,
+  days: 60 * 24,
+};
+
+export async function updateBoardAction(
+  boardId: string,
+  formData: FormData,
+): Promise<FormSubmitResult> {
+  const name = String(formData.get("name") ?? "").trim();
+  const color = String(formData.get("color") ?? "").trim();
+  const description = String(formData.get("description") ?? "").trim();
+  const icon = String(formData.get("icon") ?? "").trim();
+  const visibility = pickEnum(
+    formData.get("visibility"),
+    ["workspace", "private"] as const,
+    "workspace",
+  );
+  const createCardButtonLabel = String(
+    formData.get("createCardButtonLabel") ?? "",
+  ).trim();
+  const expirationValueRaw = String(
+    formData.get("expirationValue") ?? "",
+  ).trim();
+  const expirationUnit = pickEnum(
+    formData.get("expirationUnit"),
+    ["minutes", "hours", "days"] as const,
+    "hours",
+  );
+  const kanbanVisibleFieldIds = formData
+    .getAll("kanbanVisibleFieldIds")
+    .map((value) => String(value));
+  const onlyAssigneeCanEdit = formData.get("onlyAssigneeCanEdit") === "true";
+  const onlyManagerCanDeleteCards =
+    formData.get("onlyManagerCanDeleteCards") === "true";
+
+  if (!name) {
+    return { error: "Informe um nome para o pipe." };
+  }
+
+  const expirationValue = expirationValueRaw ? Number(expirationValueRaw) : 0;
+  const expirationMinutes =
+    expirationValue > 0
+      ? Math.round(expirationValue * EXPIRATION_UNIT_MINUTES[expirationUnit])
+      : null;
+
+  try {
+    await updateBoardForCurrentUser(boardId, {
+      name,
+      ...(color ? { color } : {}),
+      description: description || null,
+      icon: icon || null,
+      visibility,
+      createCardButtonLabel: createCardButtonLabel || null,
+      expirationMinutes,
+      kanbanVisibleFieldIds,
+      onlyAssigneeCanEdit,
+      onlyManagerCanDeleteCards,
+    });
+  } catch {
+    return { error: "Não foi possível salvar as alterações." };
+  }
+
+  manageRevalidate(boardId);
+  revalidatePath(`/boards/${boardId}`);
+  revalidatePath(`/boards/${boardId}/form`);
+  revalidatePath("/");
+  return { success: true };
 }
 
 export async function addBoardMemberAction(
@@ -104,13 +183,31 @@ export async function addBoardMemberAction(
   return { success: true };
 }
 
+/**
+ * As guardas de papel rejeitam alterações legítimas (último proprietário,
+ * mudança do próprio papel), então o resultado precisa voltar para a interface
+ * em vez de virar uma promessa rejeitada sem dono.
+ */
+function describeRoleFailure(error: unknown, fallback: string): FormSubmitResult {
+  if (error instanceof ConflictError || error instanceof AuthorizationError) {
+    return { error: error.message };
+  }
+  return { error: fallback };
+}
+
 export async function updateBoardMemberRoleAction(
   boardId: string,
   userId: string,
   role: BoardMemberRole,
-) {
-  await updateBoardMemberRoleForCurrentUser(boardId, userId, role);
+): Promise<FormSubmitResult> {
+  try {
+    await updateBoardMemberRoleForCurrentUser(boardId, userId, role);
+  } catch (error) {
+    return describeRoleFailure(error, "Não foi possível alterar o papel.");
+  }
+
   manageRevalidate(boardId);
+  return { success: true };
 }
 
 export async function removeBoardMemberAction(boardId: string, userId: string) {
@@ -152,9 +249,31 @@ export async function updateWorkspaceMemberRoleAction(
   workspaceId: string,
   userId: string,
   role: WorkspaceRole,
-) {
-  await updateWorkspaceMemberRoleForCurrentUser(workspaceId, userId, role);
+): Promise<FormSubmitResult> {
+  try {
+    await updateWorkspaceMemberRoleForCurrentUser(workspaceId, userId, role);
+  } catch (error) {
+    return describeRoleFailure(error, "Não foi possível alterar o papel.");
+  }
+
   manageRevalidate(boardId);
+  return { success: true };
+}
+
+export async function sendPasswordResetAction(
+  workspaceId: string,
+  userId: string,
+): Promise<FormSubmitResult> {
+  try {
+    await issuePasswordResetForMemberForCurrentUser(workspaceId, userId);
+  } catch (error) {
+    if (error instanceof AuthorizationError) {
+      return { error: "Você não tem permissão para redefinir esta senha." };
+    }
+    return { error: "Não foi possível enviar o link de redefinição." };
+  }
+
+  return { success: true };
 }
 
 export async function removeWorkspaceMemberAction(
@@ -187,11 +306,48 @@ export async function createCustomFieldAction(
     return { error: "Informe a chave e o rótulo do campo." };
   }
 
-  const options = type === "select" ? parseOptions(optionsRaw) : undefined;
+  const options =
+    type === "select" || type === "radio" ? parseOptions(optionsRaw) : undefined;
 
   try {
     await createCustomFieldForCurrentUser({
       boardId,
+      key,
+      label,
+      type,
+      isRequired,
+      config: options ? { options } : {},
+    });
+  } catch {
+    return { error: "Não foi possível criar o campo. Verifique a chave (letras minúsculas, números e _)." };
+  }
+
+  manageRevalidate(boardId);
+  return { success: true };
+}
+
+export async function createPhaseFieldAction(
+  boardId: string,
+  phaseId: string,
+  formData: FormData,
+): Promise<FormSubmitResult> {
+  const label = String(formData.get("label") ?? "").trim();
+  const key = String(formData.get("key") ?? "").trim();
+  const type = pickEnum(formData.get("type"), FIELD_TYPE_OPTIONS, "short_text");
+  const isRequired = formData.get("isRequired") === "true";
+  const optionsRaw = String(formData.get("options") ?? "").trim();
+
+  if (!label || !key) {
+    return { error: "Informe a chave e o rótulo do campo." };
+  }
+
+  const options =
+    type === "select" || type === "radio" ? parseOptions(optionsRaw) : undefined;
+
+  try {
+    await createCustomFieldForCurrentUser({
+      boardId,
+      phaseId,
       key,
       label,
       type,
@@ -327,7 +483,10 @@ export async function addFormFieldAction(
   const binding = String(formData.get("binding") ?? "new");
   const type = pickEnum(formData.get("type"), FIELD_TYPE_OPTIONS, "short_text");
   const isRequired = formData.get("isRequired") === "true";
-  const options = type === "select" ? parseOptions(String(formData.get("options") ?? "")) : [];
+  const options =
+    type === "select" || type === "radio"
+      ? parseOptions(String(formData.get("options") ?? ""))
+      : [];
 
   if (!label) {
     return { error: "Informe um rótulo para o campo." };

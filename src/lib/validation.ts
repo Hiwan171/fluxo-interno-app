@@ -63,6 +63,11 @@ export const createBoardSchema = z.object({
     .default("#2563eb"),
   icon: z.string().trim().max(64).nullable().optional(),
   visibility: z.enum(["workspace", "private"]).default("workspace"),
+  createCardButtonLabel: z.string().trim().max(80).nullable().optional(),
+  expirationMinutes: z.number().int().min(1).nullable().optional(),
+  kanbanVisibleFieldIds: z.array(uuidSchema).max(6).default([]),
+  onlyAssigneeCanEdit: z.boolean().default(false),
+  onlyManagerCanDeleteCards: z.boolean().default(false),
   position: z.number().int().min(0).default(0),
 });
 
@@ -95,16 +100,19 @@ export const fieldTypeSchema = z.enum([
   "datetime",
   "checkbox",
   "select",
+  "radio",
   "multiselect",
   "email",
   "phone",
   "url",
   "currency",
   "user",
+  "attachment",
 ]);
 
 export const createCustomFieldSchema = z.object({
   boardId: uuidSchema,
+  phaseId: uuidSchema.nullable().optional(),
   key: z
     .string()
     .trim()
@@ -259,6 +267,7 @@ export type UpdateUserInput = z.input<typeof updateUserSchema>;
 export type WorkspaceMemberInput = z.input<typeof workspaceMemberSchema>;
 export type CreateWorkspaceInput = z.input<typeof createWorkspaceSchema>;
 export type CreateBoardInput = z.input<typeof createBoardSchema>;
+export type UpdateBoardInput = z.input<typeof updateBoardSchema>;
 export type CreatePhaseInput = z.input<typeof createPhaseSchema>;
 export type UpdatePhaseInput = z.input<typeof updatePhaseSchema>;
 export type CreateCardInput = z.input<typeof createCardSchema>;

@@ -1,11 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { PlusIcon } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { CircleAlertIcon, PlusIcon, XIcon } from "lucide-react";
 
 import {
   addCommentAction,
+  searchBoardCardsAction,
   archiveCardAction,
+  assignCardAction,
   createCardAction,
   createPhaseAction,
   deletePhaseAction,
@@ -14,23 +17,23 @@ import {
   moveCardAction,
   movePhaseAction,
   sendCardEmailAction,
+  unassignCardAction,
   updateCardAction,
-  updatePhaseAction,
 } from "@/app/(app)/boards/[boardId]/actions";
-import { CardDetailsSheet } from "@/components/app/card-details-sheet";
+import { CardDetailsDialog } from "@/components/app/card-details-dialog";
 import { CardFormDialog } from "@/components/app/card-form-dialog";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { customFieldToFormField } from "@/components/app/custom-field-mapping";
 import { KanbanBoard } from "@/components/app/kanban-board";
-import {
-  getColorForAccent,
-  PHASE_COLOR_PALETTE,
-} from "@/components/app/phase-colors";
+import { PHASE_COLOR_PALETTE } from "@/components/app/phase-colors";
 import { PipeHeader } from "@/components/app/pipe-header";
 import type {
   AppUserDTO,
+  AssignableMemberDTO,
+  CardHistoryDTO,
   CommentDTO,
   CustomFieldDTO,
+  KanbanCardDTO,
   EmailMessageDTO,
   FormFieldDTO,
   FormInitialValue,
@@ -38,6 +41,7 @@ import type {
   KanbanColumnDTO,
   KanbanMoveInput,
 } from "@/components/app/types";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 
 const BASE_CARD_FIELDS: FormFieldDTO[] = [
@@ -103,54 +107,139 @@ const EMAIL_FORM_FIELDS: FormFieldDTO[] = [
 export interface BoardViewProps {
   boardId: string;
   boardName: string;
+  boardIcon?: string | null;
+  createCardButtonLabel?: string | null;
   workspaceName: string;
   user: AppUserDTO;
   signOutAction: () => void | Promise<void>;
   columns: KanbanColumnDTO[];
   customFields: CustomFieldDTO[];
+  kanbanVisibleFieldIds?: string[];
+  assignableMembers?: AssignableMemberDTO[];
 }
 
 export function BoardView({
   boardId,
   boardName,
+  boardIcon,
+  createCardButtonLabel,
   workspaceName,
   user,
   signOutAction,
   columns,
   customFields,
+  kanbanVisibleFieldIds = [],
+  assignableMembers = [],
 }: BoardViewProps) {
+  const router = useRouter();
   const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [emailCardId, setEmailCardId] = useState<string | null>(null);
   const [newCardPhaseId, setNewCardPhaseId] = useState<string | null>(null);
   const [creatingPhase, setCreatingPhase] = useState(false);
-  const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null);
   const [deletingPhaseId, setDeletingPhaseId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [comments, setComments] = useState<CommentDTO[]>([]);
   const [emails, setEmails] = useState<EmailMessageDTO[]>([]);
+  const [history, setHistory] = useState<CardHistoryDTO[]>([]);
   const [activityCardId, setActivityCardId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const activityLoading = openCardId !== null && activityCardId !== openCardId;
 
-  const cardFormFields = useMemo(() => {
+  /**
+   * Estas ações não têm formulário onde apoiar a mensagem — são cliques diretos
+   * (arquivar, atribuir, mover fase). Sem este envelope, uma recusa do servidor
+   * viraria uma promessa rejeitada sem dono: nada acontecia na tela e o usuário
+   * concluía que tinha funcionado.
+   */
+  async function runAction(
+    action: () => Promise<FormSubmitResult>,
+    fallbackMessage: string,
+  ): Promise<void> {
+    setActionError(null);
+
+    try {
+      const result = await action();
+
+      // A recusa vem no retorno, não como exceção: o Next apaga a mensagem de
+      // erros lançados de server actions em produção.
+      if (result?.error) setActionError(result.error);
+    } catch {
+      setActionError(fallbackMessage);
+    }
+  }
+
+  function getCardFormFields(phaseId: string | null) {
     const dynamicFields = customFields
+      .filter((field) => !field.phaseId || field.phaseId === phaseId)
       .map((field) => customFieldToFormField(field))
       .filter((field): field is FormFieldDTO => field !== null);
 
     return [...BASE_CARD_FIELDS, ...dynamicFields];
-  }, [customFields]);
+  }
+
+  // A busca vai ao servidor porque o quadro carrega no máximo 100 cards por
+  // fase: filtrar o que está em memória esconderia justamente os cards antigos.
+  const [searchResults, setSearchResults] = useState<KanbanCardDTO[] | null>(
+    null,
+  );
+  const [searching, setSearching] = useState(false);
+  const trimmedSearch = search.trim();
+  // Um termo curto não vale uma consulta; a leitura abaixo ignora resultados
+  // antigos nesse caso, então o efeito não precisa limpar estado ao sair.
+  const isSearchActive = trimmedSearch.length >= 2;
+
+  useEffect(() => {
+    if (!isSearchActive) return;
+
+    let cancelled = false;
+
+    // Espera o usuário parar de digitar antes de consultar. O indicador só
+    // acende quando a consulta realmente sai, para não piscar a cada tecla.
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      setSearching(true);
+
+      searchBoardCardsAction(boardId, trimmedSearch)
+        .then((result) => {
+          if (cancelled) return;
+          setSearchResults(result.cards);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setActionError("Não foi possível buscar os cards.");
+        })
+        .finally(() => {
+          if (!cancelled) setSearching(false);
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [boardId, isSearchActive, trimmedSearch]);
 
   const filteredColumns = useMemo(() => {
-    const query = search.trim().toLocaleLowerCase("pt-BR");
-    if (!query) return columns;
+    if (!isSearchActive || !searchResults) return columns;
 
-    return columns.map((column) => ({
-      ...column,
-      cards: column.cards.filter((card) =>
-        card.title.toLocaleLowerCase("pt-BR").includes(query)
-      ),
-    }));
-  }, [columns, search]);
+    // As colunas são remontadas a partir do resultado do servidor, não
+    // filtradas sobre o que estava carregado — é isso que faz a busca alcançar
+    // cards fora do teto por fase.
+    const byPhase = new Map<string, KanbanCardDTO[]>();
+    for (const card of searchResults) {
+      const bucket = byPhase.get(card.columnId) ?? [];
+      bucket.push(card);
+      byPhase.set(card.columnId, bucket);
+    }
+
+    return columns.map((column) => {
+      const cards = byPhase.get(column.id) ?? [];
+
+      // Durante a busca a coluna mostra quantos casaram, não o total da fase.
+      return { ...column, cards, totalCards: cards.length };
+    });
+  }, [columns, isSearchActive, searchResults]);
 
   const allCards = columns.flatMap((column) => column.cards);
   const openCard = openCardId
@@ -159,10 +248,6 @@ export function BoardView({
   const editingCard = editingCardId
     ? (allCards.find((card) => card.id === editingCardId) ?? null)
     : null;
-  const editingPhase = editingPhaseId
-    ? (columns.find((column) => column.id === editingPhaseId) ?? null)
-    : null;
-
   useEffect(() => {
     if (!openCardId) return;
 
@@ -181,7 +266,16 @@ export function BoardView({
         }))
       );
       setEmails(activity.emails);
+      setHistory(activity.history);
       setActivityCardId(openCardId);
+    }).catch(() => {
+      if (cancelled) return;
+      // Sem isto a promessa rejeitada morria em silêncio e o painel do card
+      // ficava preso no estado de carregamento, sem explicação.
+      setActivityCardId(openCardId);
+      setActionError(
+        "Não foi possível carregar o histórico deste card. Feche e abra novamente.",
+      );
     });
 
     return () => {
@@ -213,17 +307,6 @@ export function BoardView({
     ? buildCardInitialValues(editingCard)
     : {};
 
-  const editPhaseInitialValues: Record<string, FormInitialValue> = editingPhase
-    ? {
-        name: editingPhase.title,
-        color: getColorForAccent(editingPhase.accent),
-        cardLimit:
-          typeof editingPhase.limit === "number"
-            ? String(editingPhase.limit)
-            : "",
-      }
-    : {};
-
   async function handleMoveCard(input: KanbanMoveInput) {
     await moveCardAction(boardId, {
       cardId: input.cardId,
@@ -249,32 +332,50 @@ export function BoardView({
   }
 
   async function handleDuplicateCard(cardId: string) {
-    await duplicateCardAction(boardId, cardId);
+    await runAction(
+      () => duplicateCardAction(boardId, cardId),
+      "Não foi possível duplicar o card.",
+    );
   }
 
   async function handleArchiveCard(cardId: string) {
-    await archiveCardAction(boardId, cardId);
+    await runAction(
+      () => archiveCardAction(boardId, cardId),
+      "Não foi possível arquivar o card.",
+    );
+  }
+
+  async function handleAssignCard(cardId: string, userId: string) {
+    await runAction(
+      () => assignCardAction(boardId, cardId, userId),
+      "Não foi possível atribuir o responsável.",
+    );
+  }
+
+  async function handleUnassignCard(cardId: string, userId: string) {
+    await runAction(
+      () => unassignCardAction(boardId, cardId, userId),
+      "Não foi possível remover o responsável.",
+    );
   }
 
   async function handleCreatePhase(formData: FormData): Promise<FormSubmitResult> {
     return createPhaseAction(boardId, formData);
   }
 
-  async function handleEditPhase(formData: FormData): Promise<FormSubmitResult> {
-    if (!editingPhaseId) {
-      return { error: "Selecione uma fase." };
-    }
-
-    return updatePhaseAction(boardId, editingPhaseId, formData);
-  }
-
   async function handleMovePhase(columnId: string, direction: "left" | "right") {
-    await movePhaseAction(boardId, columnId, direction);
+    await runAction(
+      () => movePhaseAction(boardId, columnId, direction),
+      "Não foi possível mover a fase.",
+    );
   }
 
   async function handleDeletePhase() {
     if (!deletingPhaseId) return;
-    await deletePhaseAction(boardId, deletingPhaseId);
+    await runAction(
+      () => deletePhaseAction(boardId, deletingPhaseId),
+      "Não foi possível excluir a fase.",
+    );
   }
 
   async function handleAddComment(body: string) {
@@ -322,6 +423,7 @@ export function BoardView({
       <PipeHeader
         boardId={boardId}
         boardName={boardName}
+        boardIcon={boardIcon}
         workspaceName={workspaceName}
         user={user}
         dashboardHref="/"
@@ -330,18 +432,41 @@ export function BoardView({
         onSearchChange={setSearch}
       />
 
+      {actionError && (
+        <Alert variant="destructive" className="relative mx-4 mt-3 w-auto sm:mx-6">
+          <CircleAlertIcon />
+          <AlertDescription>{actionError}</AlertDescription>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="absolute right-2 top-2"
+            aria-label="Fechar aviso"
+            onClick={() => setActionError(null)}
+          >
+            <XIcon />
+          </Button>
+        </Alert>
+      )}
+
       <div className="relative min-h-0 flex-1 bg-[var(--workspace)]">
         <KanbanBoard
+          isUpdating={isSearchActive && searching}
           className="h-full pt-4"
           columns={filteredColumns}
           onMoveCard={handleMoveCard}
           onCardOpen={setOpenCardId}
           onCreateCard={setNewCardPhaseId}
+          createCardButtonLabel={createCardButtonLabel}
+          customFields={customFields}
+          visibleCustomFieldIds={kanbanVisibleFieldIds}
           onEditCard={setEditingCardId}
           onDuplicateCard={handleDuplicateCard}
           onArchiveCard={handleArchiveCard}
           onCreatePhase={() => setCreatingPhase(true)}
-          onEditPhase={setEditingPhaseId}
+          onEditPhase={(id) =>
+            router.push(`/boards/${boardId}/manage?tab=fases&phaseId=${id}`)
+          }
           onDeletePhase={setDeletingPhaseId}
           onMovePhase={handleMovePhase}
         />
@@ -358,7 +483,7 @@ export function BoardView({
         )}
       </div>
 
-      <CardDetailsSheet
+      <CardDetailsDialog
         card={openCard}
         open={openCardId !== null}
         onOpenChange={(open) => {
@@ -376,6 +501,12 @@ export function BoardView({
         commentsLoading={activityLoading}
         onAddComment={handleAddComment}
         emails={emails}
+        history={history}
+        columns={columns}
+        onMoveCard={handleMoveCard}
+        assignableMembers={assignableMembers}
+        onAssign={handleAssignCard}
+        onUnassign={handleUnassignCard}
       />
 
       <CardFormDialog
@@ -383,7 +514,7 @@ export function BoardView({
         onOpenChange={(open) => {
           if (!open) setNewCardPhaseId(null);
         }}
-        fields={cardFormFields}
+        fields={getCardFormFields(newCardPhaseId)}
         submitAction={handleCreateCard}
         title="Novo card"
         description="Preencha os dados para incluir o card nesta etapa."
@@ -394,7 +525,7 @@ export function BoardView({
         onOpenChange={(open) => {
           if (!open) setEditingCardId(null);
         }}
-        fields={cardFormFields}
+        fields={getCardFormFields(editingCard?.columnId ?? null)}
         submitAction={handleEditCard}
         initialValues={editCardInitialValues}
         title="Editar card"
@@ -410,19 +541,6 @@ export function BoardView({
         title="Nova fase"
         description="Adicione uma nova etapa ao final deste fluxo."
         submitLabel="Criar fase"
-      />
-
-      <CardFormDialog
-        open={editingPhaseId !== null}
-        onOpenChange={(open) => {
-          if (!open) setEditingPhaseId(null);
-        }}
-        fields={PHASE_FORM_FIELDS}
-        submitAction={handleEditPhase}
-        initialValues={editPhaseInitialValues}
-        title="Editar fase"
-        description="Atualize o nome, a cor ou o limite de cards desta etapa."
-        submitLabel="Salvar alterações"
       />
 
       <CardFormDialog
