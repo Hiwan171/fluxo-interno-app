@@ -13,6 +13,7 @@
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:seed": "tsx --conditions=react-server scripts/seed.ts",
+    "bootstrap:admin": "tsx --conditions=react-server scripts/bootstrap-admin.ts",
     "worker:email": "tsx --conditions=react-server scripts/email-worker.ts",
     "sweep:attachments": "tsx --conditions=react-server scripts/sweep-attachments.ts",
     "check:smtp": "tsx --conditions=react-server scripts/check-smtp.ts"

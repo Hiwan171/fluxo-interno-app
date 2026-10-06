@@ -126,6 +126,7 @@ services:
       - "443:443/udp"
     environment:
       APP_DOMAIN: ${APP_DOMAIN:?Defina APP_DOMAIN no arquivo .env}
+      INTERNAL_NETS: ${INTERNAL_NETS:-192.168.0.0/16 10.0.0.0/8}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Guarda os certificados do Let's Encrypt entre reinicios. Sem este
@@ -156,6 +157,12 @@ services:
     environment:
       <<: *app-environment
       NODE_ENV: development
+    # Sem este volume, `sweep:attachments` olharia uma pasta vazia em vez dos
+    # anexos reais e nao limparia nada. Os arquivos pertencem ao usuario 1001 e
+    # o `cap_drop: ALL` tira do root o poder de apagar arquivo alheio: rode a
+    # coleta com `--user 1001:1001` (ver DEPLOY.md).
+    volumes:
+      - uploads_data:/app/uploads
     depends_on:
       db:
         condition: service_healthy

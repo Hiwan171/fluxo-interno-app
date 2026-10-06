@@ -10,6 +10,8 @@ import {
   saveUploadedFile,
   type UploadedFileMeta,
 } from "@/lib/attachments";
+import { isHoneypotTripped } from "@/lib/honeypot";
+import { logger } from "@/lib/logger";
 import { submitPublicIntakeForm } from "@/lib/public-forms";
 import { clientIdentifier, consumePersistentRateLimit } from "@/lib/rate-limit";
 
@@ -55,6 +57,14 @@ export async function submitIntakeFormAction(
           "Recebemos muitos envios deste endereço. Aguarde alguns minutos e tente novamente.",
       };
     }
+  }
+
+  // Depois do rate limit, de propósito: um robô que bate no campo-isca continua
+  // gastando a própria cota. A resposta é a mesma de um envio válido, para ele
+  // não descobrir o que o denunciou, e nada é gravado — nem arquivo, nem card.
+  if (isHoneypotTripped(formData)) {
+    logger.warn("intake.honeypot", { client });
+    return { success: true, message: null };
   }
 
   const values: Record<string, unknown> = {};

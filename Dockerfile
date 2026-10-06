@@ -15,6 +15,11 @@ RUN npm ci
 # Imagem efemera para migrations, seed e outros comandos administrativos.
 FROM deps AS tooling
 COPY . .
+# O compose monta o volume de anexos aqui. Um volume nomeado novo herda dono e
+# permissao desta pasta: se o `tooling` for o primeiro a monta-lo (migrations,
+# bootstrap do admin), ele nasceria root:root e a aplicacao, que roda como o
+# usuario 1001, nao conseguiria gravar nenhum anexo.
+RUN mkdir -p /app/uploads && chown 1001:1001 /app/uploads
 
 FROM tooling AS builder
 ENV NODE_ENV=production

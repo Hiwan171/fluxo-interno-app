@@ -8,6 +8,7 @@ import { DynamicFormField } from "@/components/app/dynamic-form-field"
 import type { FormFieldDTO } from "@/components/app/types"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { HONEYPOT_FIELD_NAME } from "@/lib/honeypot"
 
 interface PublicFormFieldRow {
   id: string
@@ -161,6 +162,25 @@ export function PublicIntakeForm({
           {inputFields.map((field) => (
             <DynamicFormField key={field.name} field={field} />
           ))}
+
+          {/* Isca para robôs: fora da tela, fora da ordem de tabulação e
+              ignorada por leitores de tela. Não use `display: none`, que robôs
+              mais cuidadosos já sabem pular. */}
+          <div
+            aria-hidden="true"
+            className="absolute -left-[10000px] h-px w-px overflow-hidden"
+          >
+            <label>
+              Não preencha este campo
+              <input
+                type="text"
+                name={HONEYPOT_FIELD_NAME}
+                tabIndex={-1}
+                autoComplete="off"
+                defaultValue=""
+              />
+            </label>
+          </div>
 
           <Button type="submit" className="w-full" disabled={isSubmitting}>
             {isSubmitting && <LoaderCircleIcon className="animate-spin" />}

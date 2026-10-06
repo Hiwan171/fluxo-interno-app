@@ -7,8 +7,15 @@
 
 	# Defesa adicional para versões afetadas por bypass de middleware/proxy.
 	# A autorização também deve ser validada dentro da aplicação.
+	#
+	# Os tres `handle` abaixo sao exclusivos e avaliados na ordem em que aparecem.
+	# Esta regra precisa ser um `handle` e vir primeiro: um `respond` solto perde
+	# a vez para qualquer `handle`, porque o Caddy ordena `handle` antes de
+	# `respond`, e a regra pararia de valer sem nenhum erro.
 	@middleware_bypass header x-middleware-subrequest *
-	respond @middleware_bypass "Requisição inválida" 400
+	handle @middleware_bypass {
+		respond "Requisição inválida" 400
+	}
 
 	header {
 		-Server
@@ -19,11 +26,34 @@
 		Permissions-Policy "camera=(), geolocation=(), microphone=()"
 	}
 
+	# Superfície pública: so o formulario de entrada (a pagina e o envio, que o
+	# Next faz por POST na mesma URL), os arquivos estaticos que ele carrega e o
+	# favicon. Todo o resto — login, quadros, admin, API, anexos — so responde a
+	# quem vem da rede interna ou da VPN.
+	#
+	# Esta e uma segunda barreira. A primeira continua sendo a autenticacao da
+	# aplicacao: se esta regra falhar, quem chega de fora ainda cai no login.
+	#
+	# INTERNAL_NETS lista as redes da empresa, separadas por espaco. Nao use
+	# `private_ranges`: ele inclui 172.16.0.0/12, onde mora a rede bridge do
+	# Docker. Se algum dia o Docker mascarar o IP de origem (IPv6 via docker-proxy,
+	# por exemplo), o trafego da internet pareceria interno e o bloqueio abriria.
+	# Com a lista explicita, o caso de mascaramento falha fechado.
+	@fora_da_rede {
+		not path /f/* /_next/static/* /favicon.ico
+		not remote_ip {$INTERNAL_NETS:192.168.0.0/16 10.0.0.0/8}
+	}
+	handle @fora_da_rede {
+		respond "Não encontrado" 404
+	}
+
 	# `app` e o nome do servico na rede do compose; 127.0.0.1 apontaria para o
 	# proprio container do Caddy.
-	reverse_proxy app:3000 {
-		# Mantém streaming do App Router sem buffering no proxy.
-		flush_interval -1
+	handle {
+		reverse_proxy app:3000 {
+			# Mantém streaming do App Router sem buffering no proxy.
+			flush_interval -1
+		}
 	}
 
 	log
