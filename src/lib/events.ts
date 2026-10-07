@@ -25,6 +25,7 @@ export const CARD_EVENT_TYPES = {
   commented: "card.commented",
   emailSent: "card.email_sent",
   completed: "card.completed",
+  contractGenerated: "card.contract_generated",
 } as const;
 
 export type CardEventType =

@@ -12,6 +12,13 @@ import {
   saveUploadedFile,
   type UploadedFileMeta,
 } from "@/lib/attachments";
+import type { ContractFieldErrors } from "@/lib/contracts/fields";
+import {
+  ContractValidationError,
+  generateContractForCurrentUser,
+  prepareContractForCurrentUser,
+  type ContractPreparation,
+} from "@/lib/contracts/service";
 import {
   archiveCardForCurrentUser,
   assignCardForCurrentUser,
@@ -25,12 +32,14 @@ import {
   getCardActivityForCurrentUser,
   movePhaseForCurrentUser,
   moveCardForCurrentUser,
+  ResourceNotFoundError,
   searchBoardCardsForCurrentUser,
   sendCardEmailForCurrentUser,
   unassignCardForCurrentUser,
   updateCardForCurrentUser,
   updatePhaseForCurrentUser,
 } from "@/lib/dal";
+import { buildKanbanCards } from "@/lib/card-dto";
 import { FieldValidationError } from "@/lib/field-values";
 import { cardPrioritySchema } from "@/lib/validation";
 
@@ -465,32 +474,75 @@ export async function searchBoardCardsAction(
   boardId: string,
   query: string,
 ): Promise<BoardSearchResult> {
-  const { cards, assignees } = await searchBoardCardsForCurrentUser(
-    boardId,
-    query,
-  );
+  const { cards, extras, expirationMinutes } =
+    await searchBoardCardsForCurrentUser(boardId, query);
 
-  const assigneesByCard = new Map<string, KanbanCardDTO["assignees"]>();
-  for (const assignee of assignees) {
-    const list = assigneesByCard.get(assignee.cardId) ?? [];
-    list.push({
-      id: assignee.userId,
-      name: assignee.name,
-      avatarUrl: assignee.avatarUrl,
-    });
-    assigneesByCard.set(assignee.cardId, list);
+  return { cards: buildKanbanCards(cards, extras, expirationMinutes) };
+}
+
+export type PrepareContractResult =
+  | { ok: true; data: ContractPreparation }
+  | { ok: false; error: string };
+
+export type GenerateContractResult =
+  | { success: true; attachmentId: string; fileName: string }
+  | { success?: false; error: string; fieldErrors?: ContractFieldErrors };
+
+function describeContractFailure(error: unknown, fallback: string): string {
+  if (error instanceof AuthorizationError) {
+    return "Você não tem permissão para gerar contratos neste card.";
   }
 
-  return {
-    cards: cards.map((card) => ({
-      id: card.id,
-      columnId: card.phaseId,
-      title: card.title,
-      reference: `#${card.number}`,
-      description: card.description,
-      priority: card.priority,
-      dueDate: card.dueAt ? card.dueAt.toISOString() : null,
-      assignees: assigneesByCard.get(card.id) ?? [],
-    })),
-  };
+  if (
+    error instanceof ConflictError ||
+    error instanceof ResourceNotFoundError ||
+    error instanceof AttachmentValidationError
+  ) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+/** Rascunho do contrato a partir do card, para a tela de revisão. */
+export async function prepareContractAction(
+  cardId: string,
+): Promise<PrepareContractResult> {
+  try {
+    return { ok: true, data: await prepareContractForCurrentUser(cardId) };
+  } catch (error) {
+    return {
+      ok: false,
+      error: describeContractFailure(
+        error,
+        "Não foi possível preparar o contrato deste card.",
+      ),
+    };
+  }
+}
+
+/** Gera o PDF a partir do que foi revisado e o anexa ao card. */
+export async function generateContractAction(
+  boardId: string,
+  cardId: string,
+  fields: unknown,
+): Promise<GenerateContractResult> {
+  try {
+    const { attachmentId, fileName } = await generateContractForCurrentUser(
+      cardId,
+      fields,
+    );
+
+    revalidatePath(`/boards/${boardId}`);
+
+    return { success: true, attachmentId, fileName };
+  } catch (error) {
+    if (error instanceof ContractValidationError) {
+      return { error: error.message, fieldErrors: error.fieldErrors };
+    }
+
+    return {
+      error: describeContractFailure(error, "Não foi possível gerar o contrato."),
+    };
+  }
 }

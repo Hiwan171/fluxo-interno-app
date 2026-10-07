@@ -15,6 +15,17 @@ function entry(overrides: Partial<CardHistoryDTO> = {}): CardHistoryDTO {
 }
 
 describe("describeCardEvent", () => {
+  it("descreve a geração de contrato com o nome do arquivo", () => {
+    expect(
+      describeCardEvent(
+        entry({
+          type: "card.contract_generated",
+          metadata: { fileName: "Contrato - Acme.pdf" },
+        }),
+      ),
+    ).toBe('Ana gerou o contrato "Contrato - Acme.pdf"');
+  });
+
   it("descreve criação com a fase de entrada", () => {
     expect(
       describeCardEvent(entry({ metadata: { phaseName: "Triagem" } })),
@@ -51,6 +62,63 @@ describe("describeCardEvent", () => {
     expect(describeCardEvent(entry({ type: "card.moved", metadata: {} }))).toBe(
       "Ana moveu o card de fase",
     );
+  });
+
+  describe("eventos importados", () => {
+    it("não atribui a movimentação a um autor inexistente", () => {
+      expect(
+        describeCardEvent(
+          entry({
+            type: "card.moved",
+            actorName: null,
+            metadata: {
+              imported: true,
+              fromPhaseName: "Triagem",
+              toPhaseName: "Infra/Interno",
+            },
+          }),
+        ),
+      ).toBe('Movido de "Triagem" para "Infra/Interno" (histórico do Pipefy)');
+    });
+
+    it("identifica card aberto pelo formulário", () => {
+      expect(
+        describeCardEvent(
+          entry({
+            actorName: null,
+            metadata: { imported: true, source: "form", phaseName: "Triagem" },
+          }),
+        ),
+      ).toBe("Card aberto pelo formulário (importado do Pipefy)");
+    });
+
+    it("cita o criador original quando o card foi aberto manualmente", () => {
+      expect(
+        describeCardEvent(
+          entry({
+            actorName: null,
+            metadata: {
+              imported: true,
+              source: "manual",
+              importedCreator: "Bruna Araújo",
+              phaseName: "Triagem",
+            },
+          }),
+        ),
+      ).toBe('Bruna Araújo criou o card em "Triagem" (importado do Pipefy)');
+    });
+
+    it("cai no texto padrão para tipos sem versão importada", () => {
+      expect(
+        describeCardEvent(
+          entry({
+            type: "card.completed",
+            actorName: null,
+            metadata: { imported: true, phaseName: "Concluidos" },
+          }),
+        ),
+      ).toBe('Card concluído ao entrar em "Concluidos"');
+    });
   });
 
   it("tem texto genérico para tipo desconhecido", () => {

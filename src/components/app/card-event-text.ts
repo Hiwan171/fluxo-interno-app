@@ -13,9 +13,45 @@ function text(metadata: Record<string, unknown>, key: string): string | null {
   return typeof value === "string" && value.trim() ? value : null
 }
 
+function describeImportedEvent(entry: CardHistoryDTO): string | null {
+  const { metadata } = entry
+
+  if (entry.type === "card.created") {
+    if (metadata.source === "form") {
+      return "Card aberto pelo formulário (importado do Pipefy)"
+    }
+
+    const creator = text(metadata, "importedCreator")
+    const phaseName = text(metadata, "phaseName")
+    const where = phaseName ? ` em "${phaseName}"` : ""
+
+    return creator
+      ? `${creator} criou o card${where} (importado do Pipefy)`
+      : `Card criado${where} (importado do Pipefy)`
+  }
+
+  if (entry.type === "card.moved") {
+    const from = text(metadata, "fromPhaseName")
+    const to = text(metadata, "toPhaseName")
+
+    if (from && to) return `Movido de "${from}" para "${to}" (histórico do Pipefy)`
+    if (to) return `Movido para "${to}" (histórico do Pipefy)`
+  }
+
+  return null
+}
+
 export function describeCardEvent(entry: CardHistoryDTO): string {
   const { metadata } = entry
   const actor = entry.actorName ?? "Alguém pelo formulário público"
+
+  // Eventos trazidos de outro sistema não têm autor: o Pipefy não informa quem
+  // moveu cada card. Sem este desvio, todos apareceriam como "Alguém pelo
+  // formulário público", que é uma afirmação falsa sobre o histórico.
+  if (metadata.imported === true) {
+    const imported = describeImportedEvent(entry)
+    if (imported) return imported
+  }
 
   switch (entry.type) {
     case "card.created": {
@@ -66,6 +102,13 @@ export function describeCardEvent(entry: CardHistoryDTO): string {
 
     case "card.unassigned":
       return `${actor} removeu um responsável`
+
+    case "card.contract_generated": {
+      const fileName = text(metadata, "fileName")
+      return fileName
+        ? `${actor} gerou o contrato "${fileName}"`
+        : `${actor} gerou um contrato`
+    }
 
     default:
       return `${actor} registrou uma alteração`

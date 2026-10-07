@@ -9,6 +9,7 @@ import {
   CalendarDaysIcon,
   CheckIcon,
   CircleAlertIcon,
+  FileTextIcon,
   ListChecksIcon,
   LoaderCircleIcon,
   MailIcon,
@@ -24,6 +25,7 @@ import {
 } from "lucide-react"
 
 import { describeCardEvent } from "@/components/app/card-event-text"
+import { isFieldVisibleOnCard } from "@/components/app/phase-field-visibility"
 import { useIsPast } from "@/components/app/use-is-past"
 import type {
   AssignableMemberDTO,
@@ -196,14 +198,17 @@ function renderFieldValue(field: CustomFieldDTO, value: unknown) {
     }
 
     return (
-      <ul className="space-y-1">
+      <ul className="min-w-0 space-y-1">
         {files.map((file) => (
-          <li key={file.id}>
+          <li key={file.id} className="min-w-0">
             <a
               href={`/api/attachments/${file.id}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 text-primary hover:underline"
+              title={file.fileName}
+              // `flex` com `max-w-full`, não `inline-flex`: só assim o nome
+              // comprido encolhe com reticências em vez de invadir a coluna ao lado.
+              className="flex max-w-full min-w-0 items-center gap-1.5 text-primary hover:underline"
             >
               <PaperclipIcon className="size-3.5 shrink-0" />
               <span className="truncate">{file.fileName}</span>
@@ -239,6 +244,8 @@ export interface CardDetailsDialogProps {
   onOpenChange: (open: boolean) => void
   onEdit?: (cardId: string) => void | Promise<void>
   onSendEmail?: (cardId: string) => void | Promise<void>
+  /** Só passado em quadros que têm os campos de contrato. */
+  onGenerateContract?: (cardId: string) => void
   customFields?: CustomFieldDTO[]
   comments?: CommentDTO[]
   history?: CardHistoryDTO[]
@@ -258,6 +265,7 @@ export function CardDetailsDialog({
   onOpenChange,
   onEdit,
   onSendEmail,
+  onGenerateContract,
   customFields = [],
   comments = [],
   history = [],
@@ -371,11 +379,13 @@ export function CardDetailsDialog({
 
   const cardCustomFields = card
     ? customFields
-        .filter((field) => !field.phaseId || field.phaseId === card.columnId)
         .map((field) => ({
           field,
           value: card.customFieldValues?.[field.id],
         }))
+        .filter(({ field, value }) =>
+          isFieldVisibleOnCard(field, card.columnId, value)
+        )
     : []
 
   const cardAttachments = cardCustomFields.flatMap(({ field, value }) => {
@@ -487,6 +497,18 @@ export function CardDetailsDialog({
                   {card.title}
                 </h2>
               </div>
+              {onGenerateContract && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => onGenerateContract(card.id)}
+                >
+                  <FileTextIcon />
+                  Gerar contrato
+                </Button>
+              )}
               {onEdit && (
                 <Button
                   type="button"
@@ -598,7 +620,7 @@ export function CardDetailsDialog({
                           </dd>
                         </div>
                         {cardCustomFields.map(({ field, value }) => (
-                          <div key={field.id}>
+                          <div key={field.id} className="min-w-0">
                             <dt className="text-xs text-muted-foreground">
                               {field.label}
                             </dt>

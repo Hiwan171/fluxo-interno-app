@@ -629,6 +629,65 @@ export async function updateBoardForCurrentUser(
   return updated;
 }
 
+/**
+ * Responsáveis, valores de campo, anexos e contagem de e-mails de um conjunto de
+ * cards. Compartilhado entre o quadro e a busca: os dois precisam devolver o
+ * card completo, não uma versão resumida.
+ */
+export async function loadCardExtras(cardIds: string[]) {
+  const [assignees, fieldValues, emailCounts] = cardIds.length
+    ? await Promise.all([
+        getDb()
+          .select({
+            cardId: cardAssignees.cardId,
+            userId: users.id,
+            name: users.name,
+            avatarUrl: users.avatarUrl,
+          })
+          .from(cardAssignees)
+          .innerJoin(users, eq(users.id, cardAssignees.userId))
+          .where(inArray(cardAssignees.cardId, cardIds)),
+        getDb()
+          .select({
+            cardId: cardFieldValues.cardId,
+            customFieldId: cardFieldValues.customFieldId,
+            value: cardFieldValues.value,
+          })
+          .from(cardFieldValues)
+          .where(inArray(cardFieldValues.cardId, cardIds)),
+        getDb()
+          .select({
+            cardId: emailMessages.cardId,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(emailMessages)
+          .where(inArray(emailMessages.cardId, cardIds))
+          .groupBy(emailMessages.cardId),
+      ])
+    : [[], [], []];
+
+  const attachmentIds = fieldValues.flatMap((row) => {
+    const value = row.value as { attachmentIds?: unknown } | null;
+    return Array.isArray(value?.attachmentIds)
+      ? (value.attachmentIds as string[])
+      : [];
+  });
+
+  const attachmentRows = attachmentIds.length
+    ? await getDb()
+        .select({
+          id: attachments.id,
+          fileName: attachments.fileName,
+          mimeType: attachments.mimeType,
+          sizeBytes: attachments.sizeBytes,
+        })
+        .from(attachments)
+        .where(inArray(attachments.id, attachmentIds))
+    : [];
+
+  return { assignees, fieldValues, emailCounts, attachments: attachmentRows };
+}
+
 export async function getBoardSnapshot(boardId: string) {
   const { board } = await requireBoardAccess(boardId, "view");
 
@@ -692,56 +751,8 @@ export async function getBoardSnapshot(boardId: string) {
       .orderBy(asc(intakeForms.name)),
   ]);
 
-  const cardIds = boardCards.map((card) => card.id);
-  const [assignees, fieldValues, emailCounts] = cardIds.length
-    ? await Promise.all([
-        getDb()
-          .select({
-            cardId: cardAssignees.cardId,
-            userId: users.id,
-            name: users.name,
-            avatarUrl: users.avatarUrl,
-          })
-          .from(cardAssignees)
-          .innerJoin(users, eq(users.id, cardAssignees.userId))
-          .where(inArray(cardAssignees.cardId, cardIds)),
-        getDb()
-          .select({
-            cardId: cardFieldValues.cardId,
-            customFieldId: cardFieldValues.customFieldId,
-            value: cardFieldValues.value,
-          })
-          .from(cardFieldValues)
-          .where(inArray(cardFieldValues.cardId, cardIds)),
-        getDb()
-          .select({
-            cardId: emailMessages.cardId,
-            count: sql<number>`count(*)::int`,
-          })
-          .from(emailMessages)
-          .where(inArray(emailMessages.cardId, cardIds))
-          .groupBy(emailMessages.cardId),
-      ])
-    : [[], [], []];
-
-  const attachmentIds = fieldValues.flatMap((row) => {
-    const value = row.value as { attachmentIds?: unknown } | null;
-    return Array.isArray(value?.attachmentIds)
-      ? (value.attachmentIds as string[])
-      : [];
-  });
-
-  const boardAttachments = attachmentIds.length
-    ? await getDb()
-        .select({
-          id: attachments.id,
-          fileName: attachments.fileName,
-          mimeType: attachments.mimeType,
-          sizeBytes: attachments.sizeBytes,
-        })
-        .from(attachments)
-        .where(inArray(attachments.id, attachmentIds))
-    : [];
+  const { assignees, fieldValues, emailCounts, attachments: boardAttachments } =
+    await loadCardExtras(boardCards.map((card) => card.id));
 
   // Total real por fase, independente do teto de carregamento. A coluna precisa
   // dizer "50 de 340" em vez de mentir que existem só 50.
@@ -788,11 +799,11 @@ export async function searchBoardCardsForCurrentUser(
   boardId: string,
   query: string,
 ) {
-  await requireBoardAccess(boardId, "view");
+  const { board } = await requireBoardAccess(boardId, "view");
 
   const term = query.trim();
 
-  if (term.length < 2) return { cards: [], assignees: [] };
+  if (term.length < 2) return { cards: [], extras: await loadCardExtras([]), expirationMinutes: board.expirationMinutes };
 
   const pattern = `%${term}%`;
   const asNumber = Number(term.replace("#", ""));
@@ -815,27 +826,12 @@ export async function searchBoardCardsForCurrentUser(
     .orderBy(asc(cards.phaseId), asc(cards.position), asc(cards.number))
     .limit(BOARD_SEARCH_LIMIT);
 
-  if (matches.length === 0) return { cards: [], assignees: [] };
+  // O mesmo carregamento do quadro: o resultado precisa ser o card completo
+  // (valores de campo, anexos, responsáveis), porque é ele que o painel de
+  // detalhes abre quando o card encontrado está fora do teto por fase.
+  const extras = await loadCardExtras(matches.map((card) => card.id));
 
-  // Os responsáveis vêm junto porque o card do kanban os exibe; sem eles o
-  // resultado da busca apareceria visualmente diferente do quadro normal.
-  const assignees = await getDb()
-    .select({
-      cardId: cardAssignees.cardId,
-      userId: users.id,
-      name: users.name,
-      avatarUrl: users.avatarUrl,
-    })
-    .from(cardAssignees)
-    .innerJoin(users, eq(users.id, cardAssignees.userId))
-    .where(
-      inArray(
-        cardAssignees.cardId,
-        matches.map((card) => card.id),
-      ),
-    );
-
-  return { cards: matches, assignees };
+  return { cards: matches, extras, expirationMinutes: board.expirationMinutes };
 }
 
 export async function getAttachmentForDownload(attachmentId: string) {
@@ -1633,14 +1629,20 @@ export async function movePhaseForCurrentUser(
   });
 }
 
-export async function updateCardForCurrentUser(
-  cardId: string,
-  input: UpdateCardInput,
-) {
-  const parsed = updateCardSchema.parse(input);
-
+/**
+ * Quem pode alterar o card: editor do quadro e, quando o quadro restringe a
+ * edição ao responsável, só quem está atribuído (administradores e gerentes
+ * ficam fora da restrição). Compartilhado por tudo que escreve no card.
+ */
+export async function requireCardEditAccess(cardId: string) {
   const [card] = await getDb()
-    .select({ id: cards.id, boardId: cards.boardId })
+    .select({
+      id: cards.id,
+      boardId: cards.boardId,
+      number: cards.number,
+      title: cards.title,
+      requesterName: cards.requesterName,
+    })
     .from(cards)
     .where(eq(cards.id, cardId))
     .limit(1);
@@ -1649,10 +1651,8 @@ export async function updateCardForCurrentUser(
     throw new ResourceNotFoundError("Card não encontrado.");
   }
 
-  const { session, board, workspaceRole, boardRole } = await requireBoardAccess(
-    card.boardId,
-    "edit",
-  );
+  const access = await requireBoardAccess(card.boardId, "edit");
+  const { session, board, workspaceRole, boardRole } = access;
 
   const isExemptFromAssigneeRule =
     session.user.systemRole === "admin" ||
@@ -1666,6 +1666,17 @@ export async function updateCardForCurrentUser(
       throw new AuthorizationError();
     }
   }
+
+  return { card, ...access };
+}
+
+export async function updateCardForCurrentUser(
+  cardId: string,
+  input: UpdateCardInput,
+) {
+  const parsed = updateCardSchema.parse(input);
+
+  const { card, session, board } = await requireCardEditAccess(cardId);
 
   return getDb().transaction(async (tx) => {
     const [updated] = await tx

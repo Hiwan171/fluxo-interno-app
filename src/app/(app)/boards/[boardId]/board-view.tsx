@@ -23,6 +23,7 @@ import {
 import { CardDetailsDialog } from "@/components/app/card-details-dialog";
 import { CardFormDialog } from "@/components/app/card-form-dialog";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
+import { ContractDialog } from "@/components/app/contract-dialog";
 import { customFieldToFormField } from "@/components/app/custom-field-mapping";
 import { KanbanBoard } from "@/components/app/kanban-board";
 import { PHASE_COLOR_PALETTE } from "@/components/app/phase-colors";
@@ -43,6 +44,7 @@ import type {
 } from "@/components/app/types";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { supportsContractGeneration } from "@/lib/contracts/from-card";
 
 const BASE_CARD_FIELDS: FormFieldDTO[] = [
   {
@@ -135,6 +137,7 @@ export function BoardView({
   const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [emailCardId, setEmailCardId] = useState<string | null>(null);
+  const [contractCardId, setContractCardId] = useState<string | null>(null);
   const [newCardPhaseId, setNewCardPhaseId] = useState<string | null>(null);
   const [creatingPhase, setCreatingPhase] = useState(false);
   const [deletingPhaseId, setDeletingPhaseId] = useState<string | null>(null);
@@ -145,6 +148,11 @@ export function BoardView({
   const [activityCardId, setActivityCardId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const activityLoading = openCardId !== null && activityCardId !== openCardId;
+  // O gerador de contrato só faz sentido em quadro que tem os campos do contrato.
+  const canGenerateContract = useMemo(
+    () => supportsContractGeneration(customFields.map((field) => field.label)),
+    [customFields],
+  );
 
   /**
    * Estas ações não têm formulário onde apoiar a mensagem — são cliques diretos
@@ -241,7 +249,13 @@ export function BoardView({
     });
   }, [columns, isSearchActive, searchResults]);
 
-  const allCards = columns.flatMap((column) => column.cards);
+  // Inclui os resultados da busca: um card encontrado pode estar fora do teto de
+  // 100 por fase e, sem isto, abri-lo deixava o painel preso no carregamento.
+  // Os já carregados vêm primeiro porque refletem movimentos recentes.
+  const allCards = [
+    ...columns.flatMap((column) => column.cards),
+    ...(searchResults ?? []),
+  ];
   const openCard = openCardId
     ? (allCards.find((card) => card.id === openCardId) ?? null)
     : null;
@@ -496,6 +510,7 @@ export function BoardView({
         onSendEmail={(cardId) => {
           setEmailCardId(cardId);
         }}
+        onGenerateContract={canGenerateContract ? setContractCardId : undefined}
         customFields={customFields}
         comments={comments}
         commentsLoading={activityLoading}
@@ -553,6 +568,22 @@ export function BoardView({
         title="Enviar e-mail"
         description="O e-mail é enviado a partir deste card e fica registrado no histórico dele."
         submitLabel="Enviar"
+      />
+
+      <ContractDialog
+        boardId={boardId}
+        cardId={contractCardId}
+        open={contractCardId !== null}
+        onOpenChange={(open) => {
+          if (!open) setContractCardId(null);
+        }}
+        onGenerated={async (cardId) => {
+          // O evento "gerou o contrato" entra no histórico do card aberto.
+          if (openCardId === cardId) {
+            const activity = await getCardActivityAction(cardId);
+            setHistory(activity.history);
+          }
+        }}
       />
 
       <ConfirmDialog
