@@ -40,9 +40,16 @@ yarn-error.log*
 # uploaded attachments (dev filesystem storage)
 /uploads/
 
+# relatórios e planilhas das importações do Pipefy (dados pessoais de chamados)
+/import-report-*.json
+*.xlsx
+
 # vercel
 .vercel
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# arquivos de trabalho das ferramentas de contratos (contêm dados de clientes)
+/scripts/contracts-tools/work/
