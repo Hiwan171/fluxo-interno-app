@@ -3,7 +3,7 @@ import { loadEnvConfig } from "@next/env";
 loadEnvConfig(process.cwd());
 
 import { hash } from "@node-rs/argon2";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 
 import { closeDb, getDb } from "../src/db/client";
 import {
@@ -237,6 +237,16 @@ async function main() {
       )
       .returning();
     console.log(`${createdCards.length} cards criados.`);
+
+    // Os cards acima levam números fixos. Sem avançar o contador do quadro, o
+    // próximo card criado (pela interface ou pelo formulário público) receberia
+    // o número 1 e violaria a unicidade (board_id, number).
+    await db
+      .update(boards)
+      .set({
+        cardSequence: sql`greatest(${boards.cardSequence}, ${Math.max(...cardDefs.map((def) => def.number))})`,
+      })
+      .where(eq(boards.id, board.id));
 
     const urgentCard = createdCards.find((card) => card.number === 3);
     if (urgentCard) {

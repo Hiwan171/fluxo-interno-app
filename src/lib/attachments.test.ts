@@ -67,7 +67,31 @@ describe("sniffMimeType", () => {
   });
 });
 
+describe("sniffMimeType — Office", () => {
+  it("aceita planilha antiga (xls) pelo conteúdo", () => {
+    const xls = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.alloc(512),
+      Buffer.from("Workbook", "utf16le"),
+    ]);
+
+    expect(sniffMimeType(xls)).toBe("application/vnd.ms-excel");
+  });
+
+  it("não confia na extensão: ZIP comum com cara de documento é recusado", () => {
+    expect(sniffMimeType(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0]))).toBeNull();
+  });
+});
+
 describe("canBeServedInline", () => {
+  it("nunca exibe documentos do Office no navegador, só entrega como download", () => {
+    expect(canBeServedInline("application/vnd.ms-excel")).toBe(false);
+    expect(
+      canBeServedInline("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ).toBe(false);
+    expect(canBeServedInline("application/msword")).toBe(false);
+  });
+
   it("libera apenas os tipos verificados por assinatura", () => {
     expect(canBeServedInline("image/png")).toBe(true);
     expect(canBeServedInline("application/pdf")).toBe(true);

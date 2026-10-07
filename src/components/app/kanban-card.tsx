@@ -22,6 +22,7 @@ import type {
   KanbanPriority,
   KanbanTagDTO,
 } from "@/components/app/types"
+import { isFieldVisibleOnCard } from "@/components/app/phase-field-visibility"
 import { useIsPast } from "@/components/app/use-is-past"
 import {
   Avatar,
@@ -165,11 +166,13 @@ export function KanbanCard({
   const visibleFields = (visibleCustomFieldIds ?? [])
     .map((fieldId) => customFields?.find((field) => field.id === fieldId))
     .filter((field): field is CustomFieldDTO => Boolean(field))
-    .filter((field) => !field.phaseId || field.phaseId === card.columnId)
     .map((field) => ({
       field,
       value: card.customFieldValues?.[field.id],
     }))
+    .filter(({ field, value }) =>
+      isFieldVisibleOnCard(field, card.columnId, value)
+    )
 
   return (
     <Card

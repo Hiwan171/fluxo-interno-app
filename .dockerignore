@@ -5,6 +5,8 @@ node_modules
 coverage
 backups
 uploads
+import-report-*.json
+*.xlsx
 .env
 .env.*
 !.env.example

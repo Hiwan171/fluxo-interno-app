@@ -22,9 +22,11 @@ export function proxy(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  if (PUBLIC_ROUTES.has(pathname) && hasSessionCookie) {
-    return NextResponse.redirect(new URL("/", request.url));
-  }
+  // Quem já está logado e abre /login é mandado para dentro pela própria página,
+  // que consulta a sessão no banco. Fazer isso aqui, só porque existe um cookie,
+  // criava um laço: um cookie de sessão encerrada (senha trocada, banco
+  // restaurado, logout em outro aparelho) levava /login para /, e / de volta
+  // para /login, até o navegador desistir com ERR_TOO_MANY_REDIRECTS.
 
   return NextResponse.next();
 }

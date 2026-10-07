@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { OFFICE_TYPES, sniffOfficeType } from "@/lib/office-files";
+
 export class AttachmentValidationError extends Error {}
 
 export const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
@@ -27,6 +29,14 @@ const EXTENSION_BY_MIME_TYPE: Record<string, string> = {
   "video/webm": ".webm",
   "video/quicktime": ".mov",
   "application/pdf": ".pdf",
+  // Documentos do Office, reconhecidos por `sniffOfficeType` e sempre entregues
+  // como download. Arquivos com macro ficam de fora.
+  [OFFICE_TYPES.docx]: ".docx",
+  [OFFICE_TYPES.xlsx]: ".xlsx",
+  [OFFICE_TYPES.pptx]: ".pptx",
+  [OFFICE_TYPES.doc]: ".doc",
+  [OFFICE_TYPES.xls]: ".xls",
+  [OFFICE_TYPES.ppt]: ".ppt",
 };
 
 export const ALLOWED_MIME_TYPES = Object.keys(EXTENSION_BY_MIME_TYPE);
@@ -35,8 +45,21 @@ export const ALLOWED_MIME_TYPES = Object.keys(EXTENSION_BY_MIME_TYPE);
  * Tipos que podem ser servidos com `Content-Disposition: inline`. São formatos
  * que o navegador renderiza sem executar script do autor do arquivo — e todos
  * passaram pela verificação de assinatura no upload.
+ *
+ * Lista própria, não derivada de `ALLOWED_MIME_TYPES`: aceitar um tipo no upload
+ * não pode, por tabela, liberar a exibição dele no navegador. Documentos do
+ * Office ficam de fora e saem sempre como download.
  */
-const INLINE_SAFE_MIME_TYPES = new Set(ALLOWED_MIME_TYPES);
+const INLINE_SAFE_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "application/pdf",
+]);
 
 export function canBeServedInline(mimeType: string): boolean {
   return INLINE_SAFE_MIME_TYPES.has(mimeType);
@@ -98,7 +121,10 @@ export function sniffMimeType(buffer: Buffer): string | null {
   const isoType = isoBaseMediaType(buffer);
   if (isoType) return isoType;
 
-  return SIGNATURES.find((signature) => matches(buffer, signature))?.mimeType ?? null;
+  return (
+    SIGNATURES.find((signature) => matches(buffer, signature))?.mimeType ??
+    sniffOfficeType(buffer)
+  );
 }
 
 export function resolveUploadsDir() {
@@ -170,7 +196,7 @@ export async function saveUploadedFile(file: File): Promise<UploadedFileMeta> {
 
   if (!mimeType) {
     throw new AttachmentValidationError(
-      "Tipo de arquivo não suportado. Envie imagem (JPG, PNG, GIF, WebP), vídeo (MP4, WebM, MOV) ou PDF.",
+      "Tipo de arquivo não suportado. Envie imagem (JPG, PNG, GIF, WebP), vídeo (MP4, WebM, MOV), PDF ou documento do Office (Word, Excel, PowerPoint) sem macros.",
     );
   }
 

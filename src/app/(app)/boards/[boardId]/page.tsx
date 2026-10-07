@@ -5,11 +5,11 @@ import { BoardView } from "@/app/(app)/boards/[boardId]/board-view";
 import { getAccentForPhaseColor } from "@/components/app/phase-colors";
 import type {
   CustomFieldDTO,
-  KanbanAssigneeDTO,
   KanbanCardDTO,
   KanbanColumnDTO,
 } from "@/components/app/types";
 import { getCurrentSession } from "@/lib/auth";
+import { buildKanbanCards } from "@/lib/card-dto";
 import {
   AuthorizationError,
   getBoardSnapshot,
@@ -48,56 +48,6 @@ export default async function BoardPage({
     notFound();
   }
 
-  const assigneesByCard = new Map<string, KanbanAssigneeDTO[]>();
-  for (const assignee of snapshot.assignees) {
-    const list = assigneesByCard.get(assignee.cardId) ?? [];
-    list.push({
-      id: assignee.userId,
-      name: assignee.name,
-      avatarUrl: assignee.avatarUrl,
-    });
-    assigneesByCard.set(assignee.cardId, list);
-  }
-
-  const attachmentsById = new Map(
-    snapshot.attachments.map((attachment) => [attachment.id, attachment]),
-  );
-
-  function resolveFieldValue(value: unknown) {
-    const attachmentIds = (value as { attachmentIds?: unknown } | null)
-      ?.attachmentIds;
-    if (!Array.isArray(attachmentIds)) return value;
-
-    return {
-      attachmentIds,
-      files: attachmentIds
-        .map((id) => attachmentsById.get(id))
-        .filter((file): file is NonNullable<typeof file> => Boolean(file)),
-    };
-  }
-
-  const fieldValuesByCard = new Map<string, Record<string, unknown>>();
-  for (const row of snapshot.fieldValues) {
-    const values = fieldValuesByCard.get(row.cardId) ?? {};
-    values[row.customFieldId] = resolveFieldValue(row.value);
-    fieldValuesByCard.set(row.cardId, values);
-  }
-
-  const emailCountByCard = new Map(
-    snapshot.emailCounts
-      .filter((row): row is { cardId: string; count: number } => row.cardId !== null)
-      .map((row) => [row.cardId, row.count]),
-  );
-
-  function countAttachments(values: Record<string, unknown>) {
-    let count = 0;
-    for (const value of Object.values(values)) {
-      const files = (value as { files?: unknown } | null)?.files;
-      if (Array.isArray(files)) count += files.length;
-    }
-    return count;
-  }
-
   const customFields: CustomFieldDTO[] = snapshot.customFields.map((field) => ({
     id: field.id,
     key: field.key,
@@ -111,26 +61,21 @@ export default async function BoardPage({
       : undefined,
   }));
 
-  const expirationMinutes = snapshot.board.expirationMinutes;
-
-  // Só o prazo é calculado aqui — dado puro, derivado da entrada na fase.
-  // Comparar com a hora atual é responsabilidade do cliente, que reavalia
-  // enquanto a página estiver aberta.
-  function phaseDeadlineFor(phaseEnteredAt: Date): string | null {
-    if (expirationMinutes == null) return null;
-
-    return new Date(
-      phaseEnteredAt.getTime() + expirationMinutes * 60_000,
-    ).toISOString();
-  }
+  // O mesmo construtor da busca: quadro e resultado de busca devolvem o card
+  // completo, no mesmo formato.
+  const cardDtos = buildKanbanCards(
+    snapshot.cards,
+    snapshot,
+    snapshot.board.expirationMinutes,
+  );
 
   // Agrupar uma vez: o filtro dentro do map percorria todos os cards uma vez
   // por fase, custando O(fases x cards) a cada render.
-  const cardsByPhase = new Map<string, typeof snapshot.cards>();
-  for (const card of snapshot.cards) {
-    const bucket = cardsByPhase.get(card.phaseId) ?? [];
+  const cardsByPhase = new Map<string, KanbanCardDTO[]>();
+  for (const card of cardDtos) {
+    const bucket = cardsByPhase.get(card.columnId) ?? [];
     bucket.push(card);
-    cardsByPhase.set(card.phaseId, bucket);
+    cardsByPhase.set(card.columnId, bucket);
   }
 
   const totalByPhase = new Map(
@@ -144,20 +89,7 @@ export default async function BoardPage({
     limit: phase.cardLimit,
     isInitial: phase.isInitial,
     totalCards: totalByPhase.get(phase.id) ?? 0,
-    cards: (cardsByPhase.get(phase.id) ?? []).map<KanbanCardDTO>((card) => ({
-        id: card.id,
-        columnId: card.phaseId,
-        title: card.title,
-        reference: `#${card.number}`,
-        description: card.description,
-        priority: card.priority,
-        dueDate: card.dueAt ? card.dueAt.toISOString() : null,
-        assignees: assigneesByCard.get(card.id) ?? [],
-        customFieldValues: fieldValuesByCard.get(card.id) ?? {},
-        emailCount: emailCountByCard.get(card.id) ?? 0,
-        attachmentCount: countAttachments(fieldValuesByCard.get(card.id) ?? {}),
-        phaseDeadline: phaseDeadlineFor(card.phaseEnteredAt),
-      })),
+    cards: cardsByPhase.get(phase.id) ?? [],
   }));
 
   return (

@@ -169,7 +169,7 @@ export function DynamicFormField({
           // envio — o usuário escolheria o arquivo só para receber um erro.
           accept={
             field.accept ??
-            "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,application/pdf"
+            "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
           }
           required={field.required}
           disabled={field.disabled}

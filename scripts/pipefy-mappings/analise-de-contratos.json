@@ -1,0 +1,17 @@
+{
+  "board": {
+    "name": "Análise de Contratos",
+    "slug": "analise-de-contratos",
+    "color": "#7c3aed",
+    "visibility": "private",
+    "description": "Análise de contratos enviados pelos consultores de vendas."
+  },
+  "timezone": "America/Sao_Paulo",
+  "requesterName": "NOME DO CONSULTOR DE VENDAS:",
+  "requesterEmail": "E-MAIL DO CONSULTOR DE VENDAS:",
+  "kanbanFields": ["EMPRESA CONTRATADA:", "CIDADE:", "VIGÊNCIA DO CONTRATO:"],
+  "form": {
+    "name": "Solicitação de análise de contrato",
+    "successMessage": "Recebemos a solicitação. A análise do contrato será iniciada em breve."
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "board": {
+    "name": "Chamados de TI",
+    "slug": "chamados-ti",
+    "color": "#2563eb",
+    "description": "Chamados abertos para o setor de TI."
+  },
+  "timezone": "America/Sao_Paulo",
+  "title": "Título",
+  "description": "Detalhes da Solicitação",
+  "requesterName": "Nome do Solicitante",
+  "requesterEmail": "E-mail do Solicitante",
+  "kanbanFields": ["Categoria", "Setor"],
+  "form": {
+    "name": "Abrir chamado de TI",
+    "successMessage": "Recebemos seu chamado. A equipe de TI entrará em contato."
+  }
+}

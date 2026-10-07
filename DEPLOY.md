@@ -121,6 +121,18 @@ docker compose --profile prod up -d --build
 A senha precisa ter 12+ caracteres, com maiúscula, minúscula, número e símbolo.
 O script é seguro de repetir: se o e-mail já existe, não altera nada.
 
+Para **trocar a senha** de alguém (esquecida, ou se vazou), sem depender de e-mail:
+
+```bash
+read -rsp "Nova senha: " NEW_PASSWORD; echo; export NEW_PASSWORD
+docker compose --profile tools run --rm \
+  -e USER_EMAIL=voce@empresa.com.br -e NEW_PASSWORD \
+  tooling node_modules/.bin/tsx --conditions=react-server scripts/set-password.ts
+unset NEW_PASSWORD
+```
+
+Isso também encerra as sessões abertas dessa conta e invalida convites pendentes.
+
 ## 5. Conferir
 
 ```bash
@@ -214,6 +226,68 @@ docker compose --profile prod up -d
 
 Os anexos estão no arquivo `fluxo-interno-uploads-*.tar.gz` do mesmo horário.
 Restaure-os no volume `uploads_data` antes de subir a aplicação.
+
+## Importar chamados de um pipe do Pipefy
+
+Cria um quadro novo a partir de um relatório exportado do Pipefy: fases, campos
+(cada um na fase onde é preenchido), formulário inicial, cards, histórico de
+movimentação, comentários e anexos.
+
+1. No Pipefy, exporte o relatório do pipe **com todas as colunas** (`.xlsx`).
+   **Importe logo:** os links dos anexos no relatório expiram em cerca de 30 dias.
+2. **Simule primeiro.** Sem `--apply` nada é gravado; o comando mostra as fases,
+   os campos e o formulário que seriam criados, para você conferir.
+3. Faça um **backup** (`scripts/backup.sh`) e rode com `--apply`.
+
+```bash
+cd /opt/fluxo-interno
+docker compose --profile tools run --rm -T --user 1001:1001 \
+  -v "$PWD/relatorio.xlsx:/import/relatorio.xlsx:ro" \
+  tooling node_modules/.bin/tsx --conditions=react-server scripts/import-pipefy.ts \
+  /import/relatorio.xlsx --mapping scripts/pipefy-mappings/chamados-ti.json   # simulação
+# conferiu? repita o mesmo comando acrescentando --apply no final
+```
+
+O `--user 1001:1001` é obrigatório: é o dono dos arquivos de anexo.
+Em desenvolvimento (sem Docker): `npm run import:pipefy -- relatorio.xlsx --mapping ... [--apply]`.
+
+**O que acontece**
+
+| No Pipefy | No sistema |
+|---|---|
+| Fases | Fases, na ordem em que os cards passam por elas; a que todos visitam primeiro é a inicial |
+| Campos do formulário inicial | Campos gerais e formulário público (nasce como **rascunho**) |
+| Campos de uma fase | Campos daquela fase (continuam visíveis nos cards que já passaram por ela) |
+| Etiquetas de prioridade | Prioridade do card (crítica, alta, média, baixa); outras etiquetas não têm equivalente |
+| Criador | Origem do card (formulário ou manual); o nome do criador manual fica num campo |
+| Última movimentação por fase | Histórico do card, marcado como importado |
+| Último comentário | Um comentário no card |
+| Código | Campo "Código Pipefy", para localizar o chamado no sistema antigo |
+| Responsáveis | **Não importados**: o sistema só atribui usuários cadastrados |
+
+- Os cards são gravados direto no banco: **nenhum e-mail de automação é enviado**.
+- Os anexos são baixados do Pipefy e passam pelas mesmas regras de segurança dos
+  uploads: imagem, vídeo e PDF, e documentos do Office (Word, Excel e PowerPoint),
+  até 10 MB cada. O tipo é decidido pelo **conteúdo** do arquivo, não pela
+  extensão. Arquivos com macro ou objeto embutido (`.xlsm`, `.docm`), páginas
+  `.html`, executáveis e `.zip` são recusados. O que for recusado é listado ao
+  final, com o número do card, para você tratar à mão.
+- Documentos do Office só podem ser baixados, nunca são abertos no navegador.
+- Pipes com dados pessoais: coloque `"visibility": "private"` em `board` no
+  mapeamento. O quadro só será visto por administradores e por quem for adicionado
+  a ele.
+- Um quadro com o mesmo endereço não é sobrescrito. `--replace` só substitui
+  quadros que foram criados por uma importação (a descrição começa com "Importado
+  do Pipefy"). Os arquivos de anexo do quadro substituído ficam no volume até a
+  limpeza semanal de órfãos.
+
+**Outros pipes.** Os campos são inferidos dos dados (tipo, opções de lista, fase em
+que cada um é preenchido). Copie `scripts/pipefy-mappings/chamados-ti.json`, ajuste
+os nomes das colunas e rode a simulação: o plano mostra o que foi inferido. Dá para
+corrigir no mapeamento a ordem das fases (`phaseOrder`), o tipo de um campo
+(`fieldTypes`), a fase de um campo (`fieldPhases`), colunas a ignorar
+(`skipColumns`), o fuso das datas (`timezone`) e a tradução das etiquetas de
+prioridade (`priorities`).
 
 ## 8. Se algo der errado
 
